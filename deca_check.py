@@ -4,10 +4,12 @@
 # ///
 import pymupdf, pathlib, sys, re, csv, io, os, json, argparse, shutil
 from collections import Counter
+from PIL import Image
+
+Image.MAX_IMAGE_PIXELS = None
 
 try:
     import pillow_heif
-    from PIL import Image
     pillow_heif.register_heif_opener()
     HEIC = True
 except Exception:
