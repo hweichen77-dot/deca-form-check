@@ -6,37 +6,126 @@ Our chapter collects three signed forms from every student through a Google Form
 
 It runs purely on your local machine.
 
-## What you need
+## Setting up
 
-- Python 3.10 or newer
-- [uv](https://docs.astral.sh/uv/), which handles the dependencies on its own
-- `tesseract` for scanned or photographed forms, via `brew install tesseract`
-- `rclone`, only if you want to pull the files out of Google Drive rather than downloading them yourself
+Everything runs on a Mac with Homebrew. Once, per machine:
+
+```
+brew install uv tesseract rclone
+git clone https://github.com/hweichen77-dot/deca-form-check.git ~/deca-form-check
+cd ~/deca-form-check
+```
+
+`uv` installs each script's Python packages on first run, so there is no `pip install` step. `tesseract` reads scanned and photographed forms. `rclone` is only needed for pulling files out of Google Drive.
+
+Clone into `~/deca-form-check` specifically. The scripts default their working folders (`raw/`, `sorted/`, `templates/`, `verdicts.csv`) to that path, and cloning somewhere else means passing `--raw`, `--out`, `--csv`, and `--templates` on every run.
+
+If you will be downloading from Drive, connect rclone to the Google account that owns the registration form. This opens a browser once and then remembers you:
+
+```
+rclone config create decadrive drive scope=drive.readonly
+```
 
 ## Running it
 
-Point it at a folder of PDFs or images:
+There are two ways in, depending on whether the forms are already on your machine.
+
+### If you already have the PDFs in a folder
 
 ```
-uv run deca_check.py ~/deca-forms
+uv run deca_check.py ~/path/to/forms
 ```
 
-You get `verdicts.csv` and a `sorted/` folder of symlinks, so the original files stay where they are.
+That is the whole thing. It prints one line per file as it goes and finishes with a count.
+
+### Full run from the Google Form
+
+Four commands, in order. Each reads what the one before it wrote.
+
+Download the responses spreadsheet first. In Google Forms, open the form, go to Responses, click the Sheets icon, then in Sheets choose File, Download, Microsoft Excel. It lands in `~/Downloads`.
 
 ```
-sorted/
-├── correct/
-├── incorrect/
-└── not_sure/
+uv run extract_ids.py ~/Downloads/"2026-27 VC DECA Registration Form (Responses).xlsx" manifest.csv
 ```
 
-Flags worth knowing:
+Reads the spreadsheet and writes `manifest.csv`, one row per student per form, with the Drive file id for each upload. Prints how many students there are and how many cells were empty.
 
 ```
---debug        per-field measurements, for working out why something was misread
---templates    folder of reference forms (default: ./templates)
---no-ocr       skip tesseract, much faster, but scanned forms all land in not_sure
---out --csv    change where the results go
+uv run fetch.py manifest.csv inventory.csv
+```
+
+Downloads every file in the manifest into `raw/<file_id>/`, checks each one is really a PDF or image and not a Drive sign-in page, and writes `inventory.csv`. Safe to rerun, it skips anything already downloaded. Ends with a list of students whose file could not be fetched, if any.
+
+```
+uv run deca_check.py raw
+```
+
+Checks every downloaded file. Writes `verdicts.csv` and fills `sorted/correct`, `sorted/incorrect`, and `sorted/not_sure` with links to the originals.
+
+```
+uv run email_resubmits.py --show
+```
+
+Groups the `incorrect` verdicts by student and prints one draft email per person naming exactly which fields are blank. Also writes them to `drafts.jsonl`. Nothing is sent. Read through them, then send however you normally would.
+
+### After the run
+
+Open `sorted/not_sure/` and look at each file by eye. These are the ones the tool could not measure. `verdicts.csv` has the reason for every file, including these.
+
+Once resubmits are in, drop the new files into a folder and run `deca_check.py` on just that folder, or rerun the whole chain. `fetch.py` will pick up the new Drive ids from a fresh manifest and skip the ones it already has.
+
+### Every flag
+
+`deca_check.py`
+
+```
+uv run deca_check.py <folder or file>
+    --debug          print every field measurement, for working out why a form was misread
+    --no-ocr         skip tesseract, much faster, scanned forms all land in not_sure
+    --quiet          no per-file lines, just the final count
+    --templates DIR  reference forms to self-check against (default ~/deca-form-check/templates)
+    --out DIR        where sorted/ goes (default ~/deca-form-check/sorted)
+    --csv FILE       where verdicts go (default ~/deca-form-check/verdicts.csv)
+```
+
+`extract_ids.py`
+
+```
+uv run extract_ids.py <responses.xlsx> <manifest.csv>
+```
+
+`fetch.py`
+
+```
+uv run fetch.py <manifest.csv> <inventory.csv>
+    --remote NAME    rclone remote (default decadrive:)
+    --raw DIR        download folder (default ~/deca-form-check/raw)
+    --batch N        file ids per rclone call (default 25)
+    --workers N      parallel rclone calls (default 4)
+```
+
+`email_resubmits.py`
+
+```
+uv run email_resubmits.py
+    --verdicts FILE  (default verdicts.csv)
+    --manifest FILE  (default manifest.csv)
+    --out FILE       (default drafts.jsonl)
+    --show           print each draft in full
+    --limit N        only the first N students, for checking a few
+```
+
+`make_template.py`
+
+```
+uv run make_template.py <signed.pdf> <templates/name.pdf>
+    --pages 5        keep only page 5 (or 4-5) in the output
+```
+
+`analyze.py`
+
+```
+uv run analyze.py <file or folder>       # no arguments means ~/Downloads
 ```
 
 ## The three folders
