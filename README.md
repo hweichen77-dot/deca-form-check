@@ -42,10 +42,10 @@ That is the whole thing. It prints one line per file as it goes and finishes wit
 
 Four commands, in order. Each reads what the one before it wrote.
 
-Download the responses spreadsheet first. In Google Forms, open the form, go to Responses, click the Sheets icon, then in Sheets choose File, Download, Microsoft Excel. It lands in `~/Downloads`.
+The data comes from the Google Sheet named "(Form Checking) 2026-27 VC DECA Registration Form (Responses)", which is the response sheet linked to the registration Google Form. Download it first. Open that sheet in Google Sheets and choose File, Download, Microsoft Excel. It lands in `~/Downloads` with the same name and an `.xlsx` extension.
 
 ```
-uv run extract_ids.py ~/Downloads/"2026-27 VC DECA Registration Form (Responses).xlsx" manifest.csv
+uv run extract_ids.py ~/Downloads/"(Form Checking) 2026-27 VC DECA Registration Form (Responses).xlsx" manifest.csv
 ```
 
 Reads the spreadsheet and writes `manifest.csv`, one row per student per form, with the Drive file id for each upload. Prints how many students there are and how many cells were empty.
@@ -257,10 +257,10 @@ One thing it does not do. Fields that are not in `FORM_SPECS` are not touched, s
 
 ### extract_ids.py
 
-Reads the Google Form responses spreadsheet and writes `manifest.csv`, one row per student per form. This is the first step of a full run, and the only place the spreadsheet is read.
+Reads the registration responses spreadsheet, the Google Sheet named "(Form Checking) 2026-27 VC DECA Registration Form (Responses)" exported as `.xlsx`, and writes `manifest.csv`, one row per student per form. This is the first step of a full run, and the only place the spreadsheet is read.
 
 ```
-uv run extract_ids.py "~/Downloads/2026-27 VC DECA Registration Form (Responses).xlsx" manifest.csv
+uv run extract_ids.py ~/Downloads/"(Form Checking) 2026-27 VC DECA Registration Form (Responses).xlsx" manifest.csv
 ```
 
 The Google Form stores an uploaded file as a Drive link in the response cell. `file_id` pulls the id out with three regexes, covering the `?id=` shape Forms writes for uploads and the `/file/d/` and `/document/d/` shapes a student produces if they paste a share link instead. It also reports which shape it saw, so a run prints how many students uploaded versus pasted, and how many cells were empty or could not be parsed.
