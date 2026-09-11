@@ -1,0 +1,16 @@
+templates/
+samples/
+samples2/
+testset/
+edgetest/
+raw/
+sorted/
+*.csv
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.heic
+__pycache__/
+.venv/
+.DS_Store
