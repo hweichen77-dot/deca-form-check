@@ -60,7 +60,22 @@ Downloads every file in the manifest into `raw/<file_id>/`, checks each one is r
 uv run deca_check.py raw
 ```
 
-Checks every downloaded file. Writes `verdicts.csv` and fills `sorted/correct`, `sorted/incorrect`, and `sorted/not_sure` with links to the originals.
+Checks every downloaded file. Writes `verdicts.csv` and copies each form into `sorted/<verdict>/<student email>/`, so every student with a problem has one folder holding exactly the forms that need fixing.
+
+```
+sorted/
+├── correct/
+│   └── chloe.ding@warriorlife.net/
+│       ├── contract_Parent-Student Contract - Chloe Ding.pdf
+│       └── conduct_Code of Conduct - Chloe Ding.pdf
+├── incorrect/
+│   └── enduo.jiang@warriorlife.net/
+│       └── conduct_VCHS DECA Trip Code of Conduct - Enduo Jiang.pdf
+└── not_sure/
+    └── unknown_student/
+```
+
+The email is the student's own from the spreadsheet, or `first.last@warriorlife.net` built from their name when the sheet has none. Files with no row in `manifest.csv` go under `unknown_student/`.
 
 ```
 uv run email_resubmits.py --show
@@ -70,7 +85,7 @@ Groups the `incorrect` verdicts by student and prints one draft email per person
 
 ### After the run
 
-Open `sorted/not_sure/` and look at each file by eye. These are the ones the tool could not measure. `verdicts.csv` has the reason for every file, including these.
+Open `sorted/not_sure/` and look at each file by eye. To send a student their problem forms, their folder under `sorted/incorrect/` is ready to zip. These are the ones the tool could not measure. `verdicts.csv` has the reason for every file, including these.
 
 Once resubmits are in, drop the new files into a folder and run `deca_check.py` on just that folder, or rerun the whole chain. `fetch.py` will pick up the new Drive ids from a fresh manifest and skip the ones it already has.
 
@@ -84,6 +99,7 @@ uv run deca_check.py <folder or file>
     --no-ocr         skip tesseract, much faster, scanned forms all land in not_sure
     --quiet          no per-file lines, just the final count
     --templates DIR  reference forms to self-check against (default ~/deca-form-check/templates)
+    --manifest FILE  student list for naming the per-student folders (default ~/deca-form-check/manifest.csv)
     --out DIR        where sorted/ goes (default ~/deca-form-check/sorted)
     --csv FILE       where verdicts go (default ~/deca-form-check/verdicts.csv)
 ```
@@ -214,7 +230,7 @@ uv run deca_check.py raw/ --out ./sorted --csv ./verdicts.csv --templates ./temp
 
 `FORM_SPECS` at the top is the only place a form is described. Each entry has fingerprint phrases used to recognise the form from its text, filename hints as a tie-breaker, a `geom` saying whether answers normally sit to the right of a label or above it, and two dictionaries of fields. `signatures` lists signature lines that must also have a date next to them. `text_fields` lists everything else that must have something written in it. Each field maps to a list of label spellings, because the same form has been re-typeset over the years and "Signature of PARENT" and "Signature of Parent" are both in circulation. A label spelt `Anchor|Label` means "the word Label on the same line as Anchor", which is how the doctor's phone number is told apart from the other two Phone fields on Form B. Adding a fourth form means adding one entry here and dropping a reference into `templates/`.
 
-`main` parses flags, loads the templates, walks the input folder for PDFs and images, and runs `analyse` then `verdict` on each. It wipes and recreates the three `sorted/` subfolders on every run, writes one symlink per file into whichever folder the verdict picked, and writes `verdicts.csv`. A file that blows up anywhere in the pipeline gets a `not_sure` row with the exception text as its reason, so one corrupt upload cannot stop the other 599. The console shows one line per file as it goes, with the verdict, the form type, the filename, and the first eighty characters of the reasons.
+`main` parses flags, loads the templates, walks the input folder for PDFs and images, and runs `analyse` then `verdict` on each. It wipes and recreates the three `sorted/` subfolders on every run, looks each file up in `manifest.csv` by the Drive id in its `raw/` folder name, copies it into `sorted/<verdict>/<student email>/` with the form type prefixed, and writes `verdicts.csv` with `student` and `file_id` columns. `student_address` picks the email from the sheet, or builds one from the name. `load_manifest` reads the sheet once and tolerates it being missing, in which case everything lands under `unknown_student/`. A file that blows up anywhere in the pipeline gets a `not_sure` row with the exception text as its reason, so one corrupt upload cannot stop the other 599. The console shows one line per file as it goes, with the verdict, the form type, the filename, and the first eighty characters of the reasons.
 
 `open_doc` hands everything to PyMuPDF. HEIC photos from iPhones get converted to PNG in memory first, since PyMuPDF cannot read them directly. The function also reports whether the input is a PDF or an image, which decides later whether OCR is forced.
 
@@ -295,7 +311,7 @@ uv run email_resubmits.py --show                # print every draft in full
 uv run email_resubmits.py --limit 5 --show      # check a handful first
 ```
 
-Matching a verdict back to a student works through the symlink. `deca_check.py` writes `sorted/incorrect/<name>.pdf` as a link to `raw/<file_id>/<name>.pdf`, so resolving the link and taking the parent folder name gives the Drive file id, and that id is a key in `manifest.csv`. Verdicts for files that did not come through `fetch.py` will not resolve this way and are listed as unmatched at the end. Students with neither a student email nor a father email are listed there too, since the mother column is not consulted.
+Matching a verdict back to a student uses the `file_id` column that `deca_check.py` writes into `verdicts.csv`, which is a key in `manifest.csv`. Files that did not come through `fetch.py` have no id and are listed as unmatched at the end. Students with neither a student email nor a father email are listed there too, since the mother column is not consulted.
 
 `humanize_reason` translates the checker's field keys into words a student recognises, so `delegate_name: blank` becomes "name of delegate" and `parent_sig: date blank` becomes "the date next to the parent/guardian signature". Anything in parentheses in the reason string, which is where `verdict` puts the unverified fields, is skipped, since those need a human look and should not be sent to a student as a defect.
 
@@ -331,7 +347,7 @@ None of these are in git. They appear on your machine as you run the scripts.
 
 `templates/` holds reference forms, one or more per form type, checked at startup by `load_templates`. Build a new one from any signed submission with `make_template.py`. The current set on the maintainer's machine has one Conduct form, one Form B, and three Contract layouts covering names on page one, parent and student signatures split across pages five and six, and a signature page submitted alone. A fresh clone runs without this folder, it just skips the startup self-check.
 
-`raw/` is where `fetch.py` puts downloads, one folder per Drive file id. `sorted/` is rebuilt on every checker run and holds only symlinks into `raw/` or wherever the input lived. Deleting `sorted/` loses nothing. Deleting `raw/` means fetching again, which is fine and is what you should do once the resubmits are in.
+`raw/` is where `fetch.py` puts downloads, one folder per Drive file id. `sorted/` is rebuilt on every checker run and holds copies of the inputs, one folder per verdict and inside that one folder per student. Deleting `sorted/` loses nothing, the next run recreates it. Deleting `raw/` means fetching again, which is fine and is what you should do once the resubmits are in.
 
 `manifest.csv` comes from `extract_ids.py`. `inventory.csv` comes from `fetch.py` and is the place to look when a download failed. `verdicts.csv` is the checker's output with one row per file and the reasons written out. `drafts.jsonl` comes from `email_resubmits.py`. All four hold student names, emails, or phone numbers.
 
