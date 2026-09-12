@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["pymupdf", "pillow", "pillow-heif", "pytesseract"]
 # ///
-import pymupdf, pathlib, sys, re, csv, io, os, json, argparse, shutil
+import pymupdf, pathlib, sys, re, csv, io, json, argparse, shutil
 from collections import Counter
 from PIL import Image
 
@@ -587,6 +587,27 @@ def verdict(r):
     return "correct", ["all required signatures present, dates and fields filled"]
 
 
+def student_address(rec):
+    email = rec.get("student_email", "").strip().lower()
+    if email.endswith("@warriorlife.net"):
+        return email
+    first = re.sub(r"\s+", "", rec["first"].strip().lower())
+    last = re.sub(r"\s+", "", rec["last"].strip().lower())
+    return f"{first}.{last}@warriorlife.net"
+
+
+def load_manifest(path):
+    path = pathlib.Path(path).expanduser()
+    if not path.is_file():
+        print(f"no manifest at {path}, files will be sorted under unknown_student/")
+        return {}
+    by_id = {}
+    for rec in csv.DictReader(open(path)):
+        if rec["file_id"]:
+            by_id.setdefault(rec["file_id"], rec)
+    return by_id
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
@@ -597,6 +618,8 @@ def main():
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--templates",
                     default=str(pathlib.Path.home() / "deca-form-check/templates"))
+    ap.add_argument("--manifest",
+                    default=str(pathlib.Path.home() / "deca-form-check/manifest.csv"))
     a = ap.parse_args()
 
     global TEMPLATES
@@ -614,8 +637,9 @@ def main():
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
+    by_id = load_manifest(a.manifest)
 
-    rows, tally = [], Counter()
+    rows, tally, unmatched = [], Counter(), 0
     for p in files:
         try:
             r = analyse(p, use_ocr=not a.no_ocr, debug=a.debug)
@@ -624,15 +648,21 @@ def main():
             r = {"file": p.name, "form": "?", "pages": 0, "flags": [], "fields": {}}
             v, why = "not_sure", [f"error reading file: {type(e).__name__}: {e}"]
         tally[v] += 1
-        link = out / v / p.name
-        try:
-            os.symlink(p.resolve(), link)
-        except FileExistsError:
-            pass
+        file_id = p.resolve().parent.name
+        rec = by_id.get(file_id)
+        if rec:
+            student = student_address(rec)
+        else:
+            student, file_id = "unknown_student", ""
+            unmatched += 1
+        folder = out / v / student
+        folder.mkdir(exist_ok=True)
+        dest = folder / f"{r.get('form', '?')}_{p.name}"
+        shutil.copy2(p, dest)
         rows.append({"file": r["file"], "form": r.get("form", "?"),
                      "pages": r.get("pages", 0), "verdict": v,
                      "reasons": "; ".join(why), "flags": "; ".join(r.get("flags", [])),
-                     "path": str(link)})
+                     "student": student, "file_id": file_id, "path": str(dest)})
         if not a.quiet:
             print(f"[{v:9s}] {r.get('form','?'):9s} {r['file'][:52]:52s} {'; '.join(why)[:80]}")
 
@@ -641,6 +671,8 @@ def main():
         w.writeheader()
         w.writerows(rows)
     print(f"\n{dict(tally)}  ->  {a.csv}  |  {out}/")
+    if unmatched:
+        print(f"{unmatched} file(s) not in the manifest, sorted under unknown_student/")
 
 
 if __name__ == "__main__":

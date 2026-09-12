@@ -7,6 +7,7 @@ from PIL import Image
 import pillow_heif
 
 pillow_heif.register_heif_opener()
+Image.MAX_IMAGE_PIXELS = None
 
 SIG_WORDS = ["signature", "sign", "signed", "date", "parent", "guardian",
              "student", "print name", "printed name", "witness", "initial"]

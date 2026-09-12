@@ -98,9 +98,7 @@ def main():
     for row in csv.DictReader(open(a.verdicts)):
         if row["verdict"] != "incorrect":
             continue
-        src = pathlib.Path(row["path"])
-        fid = src.resolve().parent.name if src.is_symlink() else ""
-        rec = by_id.get(fid)
+        rec = by_id.get(row.get("file_id", ""))
         if not rec:
             unmatched.append(row["file"])
             continue
