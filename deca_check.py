@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["pymupdf", "pillow", "pillow-heif", "pytesseract"]
+# dependencies = ["pymupdf", "pillow", "pillow-heif", "pytesseract", "numpy"]
 # ///
 import pymupdf, pathlib, sys, re, csv, io, json, argparse, shutil
 from collections import Counter
@@ -16,22 +16,23 @@ except Exception:
     HEIC = False
 
 INK_MIN = 5
+TEXT_INK_MIN = 25
 INK_MAYBE = 1
 OCR_DPI = 150
 OCR_IF_TEXT_UNDER = 320
 JUNK_MAX_CHARS = 24
 CONF_LABEL = 0
 CONF_CONTENT = 60
-DARK_MIN = 0.055
-DARK_MAYBE = 0.030
-DARK_UNVERIFIED = 0.12
+DARK_UNVERIFIED = 0.05
+TEXT_DARK_UNVERIFIED = 0.03
 INVISIBLE = dict.fromkeys(map(ord, "​‌‍﻿\xa0"), None)
 IMG_EXT = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".webp", ".bmp"}
 
 FORM_SPECS = {
     "contract": {
         "geom": "right",
-        "fingerprints": ["Parent-Student Contract", "NAME OF PARENT", "NAME OF STUDENT"],
+        "fingerprints": ["Parent-Student Contract", "NAME OF PARENT", "NAME OF STUDENT",
+                         "Signature of PARENT", "Signature of STUDENT", "PROGRAM FEES"],
         "filename_hints": ["parent-student", "parent student", "contract"],
         "signatures": {
             "parent_sig": ["Signature of PARENT", "Signature of Parent"],
@@ -44,8 +45,8 @@ FORM_SPECS = {
     },
     "conduct": {
         "geom": "above",
-        "fingerprints": ["CODE OF CONDUCT", "Student Overnight Trip Expectations",
-                         "Parent Printed Name"],
+        "fingerprints": ["Trip Code of Conduct", "Student Overnight Trip Expectations",
+                         "Parent Printed Name", "Student Printed Name", "Overnight Trip"],
         "filename_hints": ["code of conduct", "conduct"],
         "signatures": {
             "parent_sig": ["Parent Signature"],
@@ -60,7 +61,10 @@ FORM_SPECS = {
         "geom": "right",
         "fingerprints": ["CALIFORNIA DECA DELEGATE PERMISSION",
                          "Please remember to fill out sections boxed in red",
-                         "Release of Claim for Damages"],
+                         "Release of Claim for Damages", "MEDICAL INFORMATION",
+                         "INSURANCE INFORMATION", "Name of Delegate",
+                         "Parent/Guardian Signature", "Emergency Medical Treatment",
+                         "Date of last tetanus shot"],
         "filename_hints": ["form_b", "form b", "formb", "medical release"],
         "needs_ocr": True,
         "soft_fields": {"tetanus"},
@@ -105,19 +109,6 @@ def open_doc(path):
     return pymupdf.open(p), "pdf"
 
 
-def detect_form(doc, path):
-    text = " ".join(p.get_text() for p in doc)
-    scores = Counter()
-    for key, spec in FORM_SPECS.items():
-        for fp in spec["fingerprints"]:
-            if fp.lower() in text.lower():
-                scores[key] += 2
-        for hint in spec["filename_hints"]:
-            if hint in pathlib.Path(path).name.lower():
-                scores[key] += 1
-    return scores.most_common(1)[0][0] if scores else "unknown"
-
-
 STOP_WORDS = {"date", "phone", "policy", "number", "company",
               "birth", "advisor", "advisors"}
 
@@ -150,15 +141,22 @@ def right_span(rect, page, words, width):
     return start, min(page.rect.x1, start + width, max(start + 3.2 * h, limit))
 
 
+DATE_EXTRA_UP = 1.5
+
+
 def regions(rect, page, width=300, prefer="right", allow_other=True, tight=False,
-            words=()):
+            words=(), extra_up=0.0, right_up=None, right_down=None):
     h = max(rect.height, 4.0)
     width = width / 11.0 * h
-    up = (2.0 if tight else 3.1) * h
+    up = ((2.0 if tight else 3.1) + extra_up) * h
     rx0, rx1 = right_span(rect, page, words, width)
+    if right_up is None:
+        right_up = 1.1 if tight else 2.4
+    if right_down is None:
+        right_down = 0.2 if tight else 0.7
     r = {
-        "right": pymupdf.Rect(rx0, max(0, rect.y0 - (0.55 if tight else 2.4) * h), rx1,
-                              rect.y1 + (0.2 if tight else 0.7) * h),
+        "right": pymupdf.Rect(rx0, max(0, rect.y0 - right_up * h), rx1,
+                              rect.y1 + right_down * h),
         "above": pymupdf.Rect(max(0, rect.x0 - 0.9 * h), max(0, rect.y0 - up),
                               min(page.rect.x1, rect.x0 + width), rect.y0 - 0.2 * h),
     }
@@ -234,21 +232,90 @@ DROP = {w.lower() for w in ("signature signatures of parent student name printed
                             "advisor advisors charge guardian in the for and").split()}
 
 
+INVERT_BELOW = 110
+
+
 def render(page):
     pix = page.get_pixmap(dpi=OCR_DPI)
-    from PIL import Image as PILImage
-    return PILImage.open(io.BytesIO(pix.tobytes("png")))
+    from PIL import Image as PILImage, ImageOps
+    img = PILImage.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    hist = img.convert("L").histogram()
+    half, acc, median = sum(hist) / 2, 0, 255
+    for v, n in enumerate(hist):
+        acc += n
+        if acc >= half:
+            median = v
+            break
+    if median < INVERT_BELOW:
+        img = ImageOps.invert(img)
+    return img
 
 
-def dark_frac(img, region):
+NONE_WORD = re.compile(r"(?i)n[\W_il1|]{0,2}a|none|no|nil")
+RULE_RUN_PX = 14
+RULE_HALF_THICK = 3
+CROP_OCR_MIN_DARK = 0.003
+
+
+def region_crop(img, region, pad=0, words=()):
+    import numpy as np
     scale = OCR_DPI / 72.0
-    box = (max(0, int(region.x0 * scale)), max(0, int(region.y0 * scale)),
-           min(img.width, int(region.x1 * scale)), min(img.height, int(region.y1 * scale)))
-    if box[2] - box[0] < 4 or box[3] - box[1] < 4:
+    box = (max(0, int(region.x0 * scale) - pad), max(0, int(region.y0 * scale) - pad),
+           min(img.width, int(region.x1 * scale) + pad), min(img.height, int(region.y1 * scale) + pad))
+    if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+        return None
+    g = np.asarray(img.crop(box).convert("L")).copy()
+    for x0, y0, x1, y1, w, conf, *_ in words:
+        if conf < CONF_CONTENT or not re.search(r"[A-Za-z]{2}", str(w)):
+            continue
+        px0, py0 = int(x0 * scale) - box[0] - 1, int(y0 * scale) - box[1] - 1
+        px1, py1 = int(x1 * scale) - box[0] + 1, int(y1 * scale) - box[1] + 1
+        if px1 <= 0 or py1 <= 0 or px0 >= g.shape[1] or py0 >= g.shape[0]:
+            continue
+        g[max(0, py0):py1, max(0, px0):px1] = 255
+    dark = g < 165
+    if dark.shape[1] > RULE_RUN_PX and dark.shape[0] > 2 * RULE_HALF_THICK:
+        win = np.lib.stride_tricks.sliding_window_view(dark, RULE_RUN_PX, axis=1).all(axis=2)
+        longrun = np.zeros_like(dark)
+        for k in range(RULE_RUN_PX):
+            longrun[:, k:k + win.shape[1]] |= win
+        t = RULE_HALF_THICK
+        thick = np.zeros_like(dark)
+        thick[t:-t] = dark[t:-t] & dark[:-2 * t] & dark[2 * t:]
+        g[longrun & ~thick] = 255
+    return g
+
+
+def dark_frac(img, region, words=()):
+    g = region_crop(img, region, words=words)
+    if g is None:
         return 0.0
-    g = img.crop(box).convert("L")
-    h = g.histogram()
-    return sum(h[:165]) / max(sum(h), 1)
+    return float((g < 165).sum()) / g.size
+
+
+def crop_ocr(img, region, drop, words=()):
+    import pytesseract
+    from PIL import Image as PILImage
+    g = region_crop(img, region, pad=int(3 * OCR_DPI / 72.0), words=words)
+    if g is None:
+        return ""
+    crop = PILImage.fromarray(g)
+    crop = crop.resize((crop.width * 2, crop.height * 2))
+    for psm in (7, 6):
+        try:
+            txt = pytesseract.image_to_string(crop, config=f"--psm {psm}")
+        except Exception:
+            return ""
+        out = []
+        for tok in txt.split():
+            c = clean(tok)
+            if c and c.lower() not in drop and re.search(r"[A-Za-z0-9]{2}", c) \
+                    and not re.fullmatch(r"(.)\1+", c):
+                out.append(c)
+        if any(re.search(r"[A-Za-z0-9]{4}|\d.*\d", c) or NONE_WORD.fullmatch(c)
+               for c in out):
+            return clean(" ".join(out))
+    return ""
 
 
 def ocr_words(page, img=None):
@@ -321,30 +388,122 @@ def find_label(words, variants):
     return None, None
 
 
+OVERLAY_ANNOTS = {"Stamp", "Ink", "FreeText", "Square", "Circle", "Line",
+                  "Polygon", "PolyLine"}
+OVERLAY_PAGE_MAX = 0.5
+OVERLAY_IMAGE_MAX = 0.25
+OVERLAY_IMAGE_MAX_COUNT = 6
+OVERLAY_MIN_COVER = 0.2
+
+
+OVERLAY_DPI = 100
+OVERLAY_MIN_PIXELS = 12
+
+
+def annot_ink(annot):
+    try:
+        pix = annot.get_pixmap(dpi=OVERLAY_DPI, alpha=True)
+    except Exception:
+        return None
+    from PIL import Image as PILImage
+    img = PILImage.frombytes("RGBA", (pix.width, pix.height), pix.samples)
+    alpha = img.getchannel("A").point(lambda a: 255 if a > 40 else 0)
+    dark = img.convert("L").point(lambda v: 255 if v < 165 else 0)
+    from PIL import ImageChops
+    return ImageChops.multiply(alpha, dark)
+
+
+def page_overlays(page):
+    area = abs(page.rect.get_area()) or 1.0
+    out = []
+    for a in page.annots():
+        if a.type[1] not in OVERLAY_ANNOTS:
+            continue
+        r = pymupdf.Rect(a.rect)
+        if abs(r.get_area()) / area >= OVERLAY_PAGE_MAX:
+            continue
+        text = a.info.get("content", "") if a.type[1] == "FreeText" else ""
+        out.append((r, text, annot_ink(a)))
+    for w in page.widgets():
+        v = str(w.field_value or "").strip()
+        if v:
+            out.append((pymupdf.Rect(w.rect), v, None))
+    small = [pymupdf.Rect(im["bbox"]) for im in page.get_image_info()
+             if 0 < abs(pymupdf.Rect(im["bbox"]).get_area()) / area < OVERLAY_IMAGE_MAX]
+    if len(small) < OVERLAY_IMAGE_MAX_COUNT:
+        out.extend((r, "", None) for r in small)
+    return out
+
+
+def ink_pixels(mask, r, inter):
+    if mask is None:
+        return None
+    sx = mask.width / max(r.width, 1e-6)
+    sy = mask.height / max(r.height, 1e-6)
+    box = (int((inter.x0 - r.x0) * sx), int((inter.y0 - r.y0) * sy),
+           int((inter.x1 - r.x0) * sx) + 1, int((inter.y1 - r.y0) * sy) + 1)
+    box = (max(0, box[0]), max(0, box[1]), min(mask.width, box[2]), min(mask.height, box[3]))
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return 0
+    return mask.crop(box).histogram()[255]
+
+
+OVERLAY_INSIDE = 0.5
+
+
+def overlays_in(region, overlays, whole=False):
+    hits, texts = 0, []
+    for r, t, mask in overlays:
+        inter = region & r
+        if inter.is_empty:
+            continue
+        if t:
+            cover = abs(inter.get_area()) / max(min(abs(r.get_area()), abs(region.get_area())), 1.0)
+            if cover < OVERLAY_MIN_COVER:
+                continue
+        elif mask is not None:
+            px = ink_pixels(mask, r, inter)
+            if px < OVERLAY_MIN_PIXELS:
+                continue
+            if whole and px < OVERLAY_INSIDE * max(mask.histogram()[255], 1):
+                continue
+        else:
+            cover = abs(inter.get_area()) / max(min(abs(r.get_area()), abs(region.get_area())), 1.0)
+            if cover < OVERLAY_MIN_COVER:
+                continue
+        hits += 1
+        if t:
+            texts.append(clean(t))
+    return hits, " ".join(texts)
+
+
 def probe(page, rect, drawings, words, width=300, img=None, prefer="right",
-          allow_other=False, fallback_text=True):
+          allow_other=False, fallback_text=True, overlays=(), extra_up=0.0, tight=None,
+          whole_ink=False, right_up=None, right_down=None):
     best = None
+    if tight is None:
+        tight = img is not None
     for geom, reg in regions(rect, page, width, prefer,
-                             allow_other=allow_other, tight=img is not None,
-                             words=words).items():
+                             allow_other=allow_other, tight=tight,
+                             words=words, extra_up=extra_up,
+                             right_up=right_up, right_down=right_down).items():
         ink = ink_in(reg, drawings)
         txt = text_in(reg, words, DROP)
-        dk = dark_frac(img, reg) if img is not None else 0.0
+        dk = dark_frac(img, reg, words) if img is not None else 0.0
         raw = text_in(reg, words, DROP, min_conf=0) if img is not None else txt
+        if img is not None and not raw and dk >= CROP_OCR_MIN_DARK:
+            raw = crop_ocr(img, reg, DROP, words)
+        ov, ovtext = overlays_in(reg, overlays, whole=whole_ink)
         if geom != prefer and not fallback_text:
             txt = raw = ""
-        cand = {"ink": ink, "text": txt, "geom": geom, "dark": dk, "raw": raw}
-        if best is None or (ink, len(txt), dk) > (best["ink"], len(best["text"]), best["dark"]):
+        if ovtext:
+            txt = clean(f"{txt} {ovtext}")
+            raw = clean(f"{raw} {ovtext}")
+        cand = {"ink": ink, "text": txt, "geom": geom, "dark": dk, "raw": raw, "overlay": ov}
+        if best is None or (ink, ov, len(txt), dk) > (best["ink"], best["overlay"],
+                                                     len(best["text"]), best["dark"]):
             best = cand
-    return best or {"ink": 0, "text": "", "geom": None, "dark": 0.0, "raw": ""}
-
-
-def marked(entry):
-    return entry["ink"] >= INK_MIN or entry["dark"] >= DARK_MIN
-
-
-def maybe_marked(entry):
-    return (INK_MAYBE <= entry["ink"] < INK_MIN) or (DARK_MAYBE <= entry["dark"] < DARK_MIN)
+    return best or {"ink": 0, "text": "", "geom": None, "dark": 0.0, "raw": "", "overlay": 0}
 
 
 def page_role(page, native):
@@ -354,6 +513,15 @@ def page_role(page, native):
            for it in d["items"]):
         return "content"
     return "junk" if len(native) < JUNK_MAX_CHARS else "content"
+
+
+SCAN_IMAGE_COVER = 0.5
+
+
+def scan_backed(page):
+    area = abs(page.rect.get_area()) or 1.0
+    return any(abs(pymupdf.Rect(im["bbox"]).get_area()) / area >= SCAN_IMAGE_COVER
+               for im in page.get_image_info())
 
 
 def page_bundles(doc, use_ocr, force_ocr=False):
@@ -368,8 +536,8 @@ def page_bundles(doc, use_ocr, force_ocr=False):
                         "err": None, "role": role, "snippet": page.get_text().strip()[:24]})
             continue
         img, used, err = None, False, None
-        if use_ocr and (force_ocr or page.get_images(full=True)) \
-                and len(native) < OCR_IF_TEXT_UNDER:
+        if use_ocr and (force_ocr or scan_backed(page)
+                        or (page.get_images(full=True) and len(native) < OCR_IF_TEXT_UNDER)):
             try:
                 img = render(page)
                 words = words + ocr_words(page, img)
@@ -377,17 +545,18 @@ def page_bundles(doc, use_ocr, force_ocr=False):
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
         out.append({"page": page, "words": words, "img": img, "ocr": used,
-                    "err": err, "role": role, "snippet": ""})
+                    "err": err, "role": role, "snippet": "",
+                    "tight": img is not None and len(native) < OCR_IF_TEXT_UNDER})
     return out
 
 
 def detect_form_text(text, path):
     scores = Counter()
-    low = text.lower()
+    flat = norm(text)
     fname = pathlib.Path(path).name.lower()
     for key, spec in FORM_SPECS.items():
         for fp in spec["fingerprints"]:
-            if fp.lower() in low:
+            if norm(fp) in flat:
                 scores[key] += 2
         for hint in spec["filename_hints"]:
             if hint in fname:
@@ -431,6 +600,7 @@ def analyse(path, use_ocr=True, debug=False):
         if not words:
             continue
         drawings = page.get_drawings()
+        overlays = page_overlays(page)
         for key, (ftype, variants) in targets.items():
             if r["fields"].get(key, {}).get("found"):
                 continue
@@ -440,13 +610,15 @@ def analyse(path, use_ocr=True, debug=False):
             m = probe(page, rect, drawings, words,
                       width=260 if ftype == "text" else 300, img=img,
                       prefer=spec.get("geom", "right"),
-                      allow_other=(ftype == "sig"), fallback_text=False)
+                      allow_other=(ftype == "sig"), fallback_text=False,
+                      overlays=overlays, tight=b["tight"], whole_ink=(ftype == "text"),
+                      right_down=(0.2 if ftype == "text" else None))
             entry = {"found": True, "page": pno, "label": label, "geom": m["geom"],
                      "ocr": b["ocr"], "ink": m["ink"], "dark": round(m["dark"], 4),
-                     "text": m["text"]}
+                     "text": m["text"], "overlay": m["overlay"]}
             if ftype == "sig":
                 mark = m.get("raw") or m["text"]
-                entry["signed"] = m["ink"] >= INK_MIN or bool(mark)
+                entry["signed"] = m["ink"] >= INK_MIN or bool(mark) or m["overlay"] > 0
                 entry["ink_unverified"] = (not entry["signed"]
                                            and img is not None
                                            and m["dark"] >= DARK_UNVERIFIED)
@@ -458,21 +630,28 @@ def analyse(path, use_ocr=True, debug=False):
                 entry["date_found"] = drect is not None
                 if drect is not None:
                     d = probe(page, drect, drawings, words, width=200, img=img,
-                              prefer=spec.get("geom", "right"), allow_other=True)
+                              prefer=spec.get("geom", "right"),
+                              allow_other=(spec.get("geom") == "above"),
+                              overlays=overlays, extra_up=DATE_EXTRA_UP, tight=b["tight"],
+                              whole_ink=True, right_up=(None if b["tight"] else 1.2))
                     entry["date_text"] = d["text"]
                     entry["date_ink"] = d["ink"]
                     entry["date_dark"] = round(d["dark"], 4)
                     entry["date_present"] = bool(d.get("raw") or d["text"]) \
-                        or d["ink"] >= INK_MIN
+                        or d["ink"] >= TEXT_INK_MIN or d["overlay"] > 0
                 else:
                     entry.update(date_text="", date_ink=0, date_dark=0.0,
                                  date_present=False)
             else:
-                entry["filled"] = bool(m.get("raw") or m["text"]) or m["ink"] >= INK_MIN
+                entry["filled"] = bool(m.get("raw") or m["text"]) or m["ink"] >= TEXT_INK_MIN \
+                    or m["overlay"] > 0
+                entry["ink_unverified"] = (not entry["filled"] and img is not None
+                                           and m["dark"] >= TEXT_DARK_UNVERIFIED)
             r["fields"][key] = entry
             if debug:
-                print(f"    DBG {key:14s} p{pno} ink={m['ink']:5d} dark={m['dark']:.4f} "
-                      f"geom={m['geom']} text={m['text'][:24]!r} raw={m.get('raw','')[:24]!r}")
+                print(f"    DBG {key:14s} p{pno} ink={m['ink']:5d} ov={m['overlay']} "
+                      f"dark={m['dark']:.4f} geom={m['geom']} text={m['text'][:24]!r} "
+                      f"raw={m.get('raw','')[:24]!r}")
 
     for key in targets:
         r["fields"].setdefault(key, {"found": False})
@@ -563,7 +742,10 @@ def verdict(r):
         if not f.get("found"):
             unsure.append(f"{key}: field not located")
         elif not f.get("filled"):
-            if key in spec.get("soft_fields", ()):
+            if f.get("ink_unverified"):
+                unsure.append(f"{key}: something is written but it could not be read, "
+                              "check by eye")
+            elif key in spec.get("soft_fields", ()):
                 unsure.append(f"{key}: blank, check whether that is acceptable")
             else:
                 bad.append(f"{key}: blank")
