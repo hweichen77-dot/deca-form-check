@@ -22,6 +22,7 @@ TEXT_WIDTH = 260
 TEXT_WIDE = 400
 INK_MAYBE = 1
 OCR_DPI = 150
+OCR_MIN_LONG_EDGE = 1650
 OCR_IF_TEXT_UNDER = 320
 JUNK_MAX_CHARS = 24
 CONF_LABEL = 0
@@ -344,8 +345,13 @@ CROP_LABEL_FUZZ = 0.6
 INVERT_BELOW = 110
 
 
+def page_dpi(page):
+    return max(OCR_DPI, 72.0 * OCR_MIN_LONG_EDGE / max(page.rect.width, page.rect.height, 1.0))
+
+
 def render(page):
-    pix = page.get_pixmap(dpi=OCR_DPI)
+    dpi = page_dpi(page)
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(dpi / 72.0, dpi / 72.0))
     from PIL import Image as PILImage, ImageOps
     img = PILImage.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
     hist = img.convert("L").histogram()
@@ -359,6 +365,7 @@ def render(page):
     if inverted:
         img = ImageOps.invert(img)
     img.info["inverted"] = inverted
+    img.info["dpi"] = dpi
     return img
 
 
@@ -438,7 +445,7 @@ def grey_no_red(img):
 
 def region_crop(img, region, pad=0, words=()):
     import numpy as np
-    scale = OCR_DPI / 72.0
+    scale = img.info["dpi"] / 72.0
     box = (max(0, int(region.x0 * scale) - pad), max(0, int(region.y0 * scale) - pad),
            min(img.width, int(region.x1 * scale) + pad), min(img.height, int(region.y1 * scale) + pad))
     if box[2] - box[0] < 8 or box[3] - box[1] < 8:
@@ -448,7 +455,7 @@ def region_crop(img, region, pad=0, words=()):
     return erase_rules(g, RULE_RUN_PX, RULE_HALF_THICK)
 
 
-FAINT_DPI = 300
+FAINT_ZOOM = 2
 FAINT_MIN_AREA = 0.25
 FAINT_WEAK_MIN_AREA = 0.05
 FAINT_FLOOR_CAP = 0.5
@@ -461,9 +468,9 @@ BELOW_MIN_AREA = 0.3
 def faint_area(page, region, words, h, inverted=False):
     import numpy as np
     from PIL import Image as PILImage, ImageFilter, ImageOps
-    scale = FAINT_DPI / 72.0
+    scale = FAINT_ZOOM * page_dpi(page) / 72.0
     try:
-        pix = page.get_pixmap(dpi=FAINT_DPI, clip=region)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), clip=region)
     except Exception:
         return 0.0
     img = PILImage.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
@@ -496,7 +503,7 @@ def strong_token(text):
 def crop_ocr(img, region, drop, words=(), weak=False):
     import pytesseract
     from PIL import Image as PILImage
-    g = region_crop(img, region, pad=int(3 * OCR_DPI / 72.0), words=words)
+    g = region_crop(img, region, pad=int(3 * img.info["dpi"] / 72.0), words=words)
     if g is None:
         return ""
     crop = PILImage.fromarray(g)
@@ -530,7 +537,7 @@ OCR_PSMS = (3, 11)
 def ocr_words(page, img=None):
     import pytesseract
     img = img or render(page)
-    scale = 72.0 / OCR_DPI
+    scale = 72.0 / img.info["dpi"]
     out = []
     for psm in OCR_PSMS:
         data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT,
