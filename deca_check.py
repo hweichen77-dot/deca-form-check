@@ -18,6 +18,8 @@ except Exception:
 
 INK_MIN = 5
 TEXT_INK_MIN = 25
+TEXT_WIDTH = 260
+TEXT_WIDE = 400
 INK_MAYBE = 1
 OCR_DPI = 150
 OCR_IF_TEXT_UNDER = 320
@@ -70,9 +72,8 @@ FORM_SPECS = {
                          "Date of last tetanus shot"],
         "filename_hints": ["form_b", "form b", "formb", "medical release"],
         "needs_ocr": True,
-        "soft_fields": {"tetanus"},
-        "mark_fields": {"allergies", "medication", "heart_condition",
-                        "physical_restrictions", "other_conditions"},
+        "optional_fields": {"allergies", "medication", "heart_condition",
+                            "physical_restrictions", "other_conditions"},
         "reach_down": {"home_address": 1.6},
         "signatures": {
             "student_sig": ["Student Signature"],
@@ -367,6 +368,7 @@ NONE_WORD = re.compile(r"(?i)n[\W_il1|]{0,2}a|none|no|nil")
 RULE_RUN_PX = 40
 RULE_HALF_THICK = 3
 CROP_OCR_MIN_DARK = 0.003
+CROP_MIN_CONF = 0
 
 
 RULE_DILATE_PX = 2
@@ -502,11 +504,14 @@ def crop_ocr(img, region, drop, words=(), weak=False):
     fallback = ""
     for psm in (7, 6):
         try:
-            txt = pytesseract.image_to_string(crop, config=f"--psm {psm}")
+            data = pytesseract.image_to_data(crop, config=f"--psm {psm}",
+                                             output_type=pytesseract.Output.DICT)
         except Exception:
             return ""
+        toks = [t for t, cf in zip(data["text"], data["conf"])
+                if t.strip() and int(cf) >= CROP_MIN_CONF]
         out = []
-        for tok in txt.split():
+        for tok in toks:
             c = clean(tok)
             if c and c.lower() not in drop and re.search(r"[A-Za-z0-9]{2}", c) \
                     and not re.fullmatch(r"(.)\1+", c) \
@@ -774,9 +779,15 @@ def probe(page, rect, drawings, words, width=300, img=None, prefer="right",
         h = max(rect.height, 4.0)
         ink = ink_in(reg, drawings, (rect.y0 + rect.y1) / 2 if whole_ink and geom == "right" else None, h)
         treg = pymupdf.Rect(reg.x0 - TEXT_X_SLACK * h, reg.y0, reg.x1, reg.y1) if geom == "right" else reg
-        txt = text_in(treg, words, DROP)
+        wide = treg
+        if geom == "right" and not sig_field:
+            wide = pymupdf.Rect(treg.x0, treg.y0,
+                                max(treg.x1, right_span(rect, page, words, TEXT_WIDE / 11.0 * h)[1]),
+                                treg.y1)
+        txt = text_in(wide, words, DROP)
         dk = dark_frac(img, reg, words) if img is not None else 0.0
         raw = text_in(treg, words, DROP, min_conf=0) if img is not None else txt
+        weak = raw
         if raw and not txt and not sig_field:
             raw = clean(" ".join(c for c in raw.split() if plausible_token(c)))
         if img is not None and not raw and dk >= CROP_OCR_MIN_DARK:
@@ -789,7 +800,7 @@ def probe(page, rect, drawings, words, width=300, img=None, prefer="right",
             txt = clean(f"{txt} {ovtext}")
             raw = clean(f"{raw} {ovtext}")
         cand = {"ink": ink, "text": txt, "geom": geom, "dark": dk, "raw": raw, "overlay": ov,
-                "reg": reg, "pref_reg": reg if geom == prefer else None}
+                "weak": weak, "reg": reg, "pref_reg": reg if geom == prefer else None}
         if best is None or (ink, ov, len(raw), len(txt), dk) > (
                 best["ink"], best["overlay"], len(best["raw"]), len(best["text"]), best["dark"]):
             best = cand
@@ -910,6 +921,33 @@ def detect_form_text(text, path):
 
 
 STACK_ROW_GAP = 0.7
+SYNTH_ROWS = {"family_doctor": ("other_conditions", "physical_restrictions")}
+PHONE_X_FRAC = (0.53, 0.60)
+SYNTH_MAX_LABEL_H = 12.0
+
+
+def synth_label(key, fields, pno, page):
+    def rect_of(k):
+        f = fields.get(k, {})
+        return pymupdf.Rect(f["rect"]) if f.get("found") and f.get("page") == pno else None
+    if key in SYNTH_ROWS:
+        below, above = (rect_of(k) for k in SYNTH_ROWS[key])
+        if below is None:
+            return None, None
+        h = max(below.height, 4.0)
+        pitch = (below.y0 - above.y0) if above is not None and 1.2 * h < below.y0 - above.y0 < 3 * h \
+            else 2.1 * h
+        return "synth:" + key, pymupdf.Rect(below.x0, below.y0 + pitch, below.x0 + 7 * h, below.y1 + pitch)
+    if key == "doctor_phone":
+        fd = rect_of("family_doctor")
+        if fd is None:
+            return None, None
+        x0 = fd.x0 + PHONE_X_FRAC[0] * (page.rect.x1 - fd.x0)
+        x1 = fd.x0 + PHONE_X_FRAC[1] * (page.rect.x1 - fd.x0)
+        hcap = SYNTH_MAX_LABEL_H * page.rect.x1 / 612.0
+        y1 = min(fd.y1, fd.y0 + hcap)
+        return "synth:doctor_phone", pymupdf.Rect(x0, fd.y0, x1, y1)
+    return None, None
 
 
 def stacked_above(fields, pno, rect, words):
@@ -922,8 +960,10 @@ def stacked_above(fields, pno, rect, words):
     f = max(prev, key=lambda f: f["rect"][3])
     reg = pymupdf.Rect(f["reg"])
     rows = sorted((w[1] + w[3]) / 2 for w in words
-                  if w[5] >= CONF_CONTENT and w[0] >= f["rect"][2]
-                  and pymupdf.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) in reg
+                  if w[5] >= CONF_CONTENT and (w[0] + w[2]) / 2 >= f["rect"][2] - 2 * h
+                  and (pymupdf.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) in reg
+                       or (f["rect"][1] - 0.3 * h <= (w[1] + w[3]) / 2 <= rect.y0 + 0.2 * h
+                           and (w[0] + w[2]) / 2 < reg.x1))
                   and (w[1] + w[3]) / 2 >= f["rect"][1] - 0.3 * h
                   and re.search(r"[A-Za-z0-9]", str(w[4])))
     return bool(rows) and rows[-1] - rows[0] > STACK_ROW_GAP * h
@@ -974,9 +1014,11 @@ def analyse(path, use_ocr=True, debug=False):
                 continue
             label, rect = find_label(words, variants)
             if rect is None:
+                label, rect = synth_label(key, r["fields"], pno, page)
+            if rect is None:
                 continue
             m = probe(page, rect, drawings, words,
-                      width=260 if ftype == "text" else 300, img=img,
+                      width=TEXT_WIDTH if ftype == "text" else 300, img=img,
                       prefer=spec.get("geom", "right"),
                       allow_other=(ftype == "sig"), fallback_text=False,
                       overlays=overlays, tight=b["tight"], whole_ink=(ftype == "text"),
@@ -1128,9 +1170,7 @@ def analyse(path, use_ocr=True, debug=False):
                 entry["filled"] = bool(m.get("raw") or m["text"]) or m["ink"] >= TEXT_INK_MIN \
                     or m["overlay"] > 0
                 entry["ink_unverified"] = (not entry["filled"] and img is not None
-                                           and m["dark"] >= TEXT_DARK_UNVERIFIED) \
-                    or (not entry["filled"] and key in spec.get("mark_fields", ())
-                        and m["ink"] >= INK_MAYBE)
+                                           and m["dark"] >= TEXT_DARK_UNVERIFIED)
                 if not entry["filled"] and not entry["ink_unverified"] and spec.get("geom") == "right":
                     entry["ink_unverified"] = stacked_above(r["fields"], pno, rect, words)
                 if not entry["filled"] and not entry["ink_unverified"] and img is not None \
@@ -1247,6 +1287,8 @@ def verdict(r):
                 bad.append(f"{key}: date blank")
 
     for key in spec["text_fields"]:
+        if key in spec.get("optional_fields", ()):
+            continue
         f = r["fields"].get(key, {})
         if not f.get("found"):
             unsure.append(f"{key}: field not located")
