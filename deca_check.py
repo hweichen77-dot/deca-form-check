@@ -75,7 +75,8 @@ FORM_SPECS = {
         "needs_ocr": True,
         "optional_fields": {"allergies", "medication", "heart_condition",
                             "physical_restrictions", "other_conditions",
-                            "tetanus", "insurance_company", "policy_number"},
+                            "tetanus", "insurance_company", "policy_number", "dob"},
+        "dates_optional": True,
         "reach_down": {"home_address": 1.6},
         "signatures": {
             "student_sig": ["Student Signature"],
@@ -1316,6 +1317,8 @@ def verdict(r):
             unsure.append(f"{key}: something sits near the signature line but off it, check by eye")
         else:
             bad.append(f"{key}: not signed (blank)")
+        if spec.get("dates_optional"):
+            continue
         if not f.get("date_present"):
             if not f.get("date_found"):
                 unsure.append(f"{key}: date line not found on the page")
