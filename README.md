@@ -296,6 +296,8 @@ Reads the registration responses spreadsheet, the Google Sheet named "(Form Chec
 uv run extract_ids.py ~/Downloads/"(Form Checking) 2026-27 VC DECA Registration Form (Responses).xlsx" manifest.csv
 ```
 
+Columns are found by header text, not position, because the sheet gets edited and columns shift. The script prints the column it chose for each field at the start of a run. If a header is renamed so that none matches, it stops and names the missing one. A run that reports hundreds of `unparsed` cells means a form column landed on an answer column such as the bus stop question, so check that printout first.
+
 The Google Form stores an uploaded file as a Drive link in the response cell. `file_id` pulls the id out with three regexes, covering the `?id=` shape Forms writes for uploads and the `/file/d/` and `/document/d/` shapes a student produces if they paste a share link instead. It also reports which shape it saw, so a run prints how many students uploaded versus pasted, and how many cells were empty or could not be parsed.
 
 Column positions are hard-coded at the top in `FORMS` and `COLS`, as zero-based indexes into the sheet row. Columns 24, 25, and 26 are the three form uploads. First name, last name, grade, emails, and phone are read from their own columns. If the form gains or loses a question, those numbers shift and this file needs updating. The run ends by printing how many rows are missing each contact field, which is a quick way to notice that the spreadsheet columns have moved. If every row shows every field missing, the indexes are wrong.

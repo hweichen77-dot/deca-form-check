@@ -4,9 +4,11 @@
 # ///
 import openpyxl, pathlib, sys, re, csv
 
-FORMS = {24: "formB", 25: "conduct", 26: "contract"}
-COLS = dict(first=1, last=2, grade=6, student_email=44,
-            dad_email=13, mom_email=17, phone=9)
+FORM_HEADERS = {"medical release": "formB", "code of conduct": "conduct",
+                "parent-student contract": "contract"}
+COL_HEADERS = dict(first="legal first name", last="legal last name", grade="grade (",
+                   student_email="email address", dad_email="father/guardian email",
+                   mom_email="mother/guardian 2  email", phone="cell phone")
 
 ID_PATTERNS = [r"[?&]id=([\w-]+)", r"/file/d/([\w-]+)", r"/document/d/([\w-]+)"]
 
@@ -22,10 +24,21 @@ def cell(row, i):
     return row[i] if i < len(row) else None
 
 
+def locate(header, needle):
+    hits = [i for i, h in enumerate(header) if needle in str(h or "").lower()]
+    if not hits:
+        sys.exit(f"no column header containing {needle!r}")
+    return hits[0]
+
+
 def main(xlsx, out):
     wb = openpyxl.load_workbook(pathlib.Path(xlsx).expanduser(), read_only=True, data_only=True)
-    rows = [r for r in list(wb.worksheets[0].iter_rows(values_only=True))[1:]
-            if any(x is not None and str(x).strip() for x in r)]
+    sheet = list(wb.worksheets[0].iter_rows(values_only=True))
+    header = sheet[0]
+    FORMS = {locate(header, k): v for k, v in FORM_HEADERS.items()}
+    COLS = {k: locate(header, v) for k, v in COL_HEADERS.items()}
+    print("columns:", {v: k for k, v in FORMS.items()}, COLS)
+    rows = [r for r in sheet[1:] if any(x is not None and str(x).strip() for x in r)]
     recs, stats = [], {"upload": 0, "pasted_link": 0, "unparsed": 0, "empty": 0}
     for i, r in enumerate(rows, start=2):
         base = {k: str(cell(r, c) or "").strip() for k, c in COLS.items()}
