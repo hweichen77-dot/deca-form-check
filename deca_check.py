@@ -74,7 +74,8 @@ FORM_SPECS = {
         "filename_hints": ["form_b", "form b", "formb", "medical release"],
         "needs_ocr": True,
         "optional_fields": {"allergies", "medication", "heart_condition",
-                            "physical_restrictions", "other_conditions"},
+                            "physical_restrictions", "other_conditions",
+                            "tetanus", "insurance_company", "policy_number"},
         "reach_down": {"home_address": 1.6},
         "signatures": {
             "student_sig": ["Student Signature"],
