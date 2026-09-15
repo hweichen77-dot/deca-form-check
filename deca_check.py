@@ -914,18 +914,49 @@ def page_bundles(doc, use_ocr, force_ocr=False):
     return out
 
 
+FORM_NAMES = {"contract": "Parent-Student Contract", "conduct": "Code of Conduct",
+              "formB": "Medical Release (Form B)"}
+LABEL_ID_MIN = 2
+
+
 def detect_form_text(text, path):
-    scores = Counter()
+    scores, in_text = Counter(), set()
     flat = norm(text)
     fname = pathlib.Path(path).name.lower()
     for key, spec in FORM_SPECS.items():
         for fp in spec["fingerprints"]:
             if norm(fp) in flat:
                 scores[key] += 2
+                in_text.add(key)
         for hint in spec["filename_hints"]:
             if hint in fname:
                 scores[key] += 1
-    return scores.most_common(1)[0][0] if scores else "unknown"
+    return scores, in_text
+
+
+def detect_form_labels(bundles):
+    found = Counter()
+    for key, spec in FORM_SPECS.items():
+        for variants in (*spec["signatures"].values(), *spec["text_fields"].values()):
+            if any(find_label(b["words"], variants)[1] is not None
+                   for b in bundles if b["words"]):
+                found[key] += 1
+    return {k for k, c in found.items() if c >= LABEL_ID_MIN}
+
+
+def detect_form(bundles, path, slot=None):
+    text = " ".join(str(w[4]) for b in bundles for w in b["words"])
+    scores, in_text = detect_form_text(text, path)
+    if slot in in_text:
+        return slot, False
+    if scores:
+        form = scores.most_common(1)[0][0]
+        return form, slot is not None and form != slot
+    by_labels = detect_form_labels(bundles)
+    if not by_labels:
+        return "unknown", False
+    form = slot if slot in by_labels else sorted(by_labels)[0]
+    return form, slot is not None and form != slot
 
 
 STACK_ROW_GAP = 0.7
@@ -977,7 +1008,7 @@ def stacked_above(fields, pno, rect, words):
     return bool(rows) and rows[-1] - rows[0] > STACK_ROW_GAP * h
 
 
-def analyse(path, use_ocr=True, debug=False):
+def analyse(path, use_ocr=True, debug=False, slot=None):
     doc, kind = open_doc(path)
     r = {"file": pathlib.Path(path).name, "pages": doc.page_count,
          "kind": kind, "flags": [], "fields": {}}
@@ -996,9 +1027,8 @@ def analyse(path, use_ocr=True, debug=False):
                            for i in junk)
         r["flags"].append(f"skipped blank page(s): {labels}")
 
-    alltext = " ".join(str(w[4]) for b in bundles for w in b["words"])
-    form = detect_form_text(alltext, path)
-    r["form"] = form
+    form, mismatch = detect_form(bundles, path, slot)
+    r["form"], r["slot"], r["slot_mismatch"] = form, slot, mismatch
     spec = FORM_SPECS.get(form)
     if not spec:
         r["flags"].append("unknown_form_type")
@@ -1262,6 +1292,9 @@ def load_templates(d, use_ocr=True):
 def verdict(r):
     if r["form"] == "unknown":
         return "not_sure", ["could not identify which form this is"]
+    if r.get("slot_mismatch"):
+        return "incorrect", [f"this is the {FORM_NAMES[r['form']]}, "
+                             f"uploaded in the {FORM_NAMES[r['slot']]} slot"]
     spec = FORM_SPECS[r["form"]]
     bad, unsure = [], []
 
@@ -1352,9 +1385,9 @@ def load_manifest(path):
 
 
 def check_one(args):
-    p, use_ocr, debug = args
+    p, use_ocr, debug, slot = args
     try:
-        r = analyse(p, use_ocr=use_ocr, debug=debug)
+        r = analyse(p, use_ocr=use_ocr, debug=debug, slot=slot)
         v, why = verdict(r)
     except Exception as e:
         r = {"file": p.name, "form": "?", "pages": 0, "flags": [], "fields": {}}
@@ -1395,13 +1428,14 @@ def main():
     by_id = load_manifest(a.manifest)
 
     rows, tally, unmatched = [], Counter(), 0
-    job = (not a.no_ocr, a.debug)
+    jobs = [(p, not a.no_ocr, a.debug,
+             by_id.get(p.resolve().parent.name, {}).get("form")) for p in files]
     if a.workers > 1 and len(files) > 1:
         import multiprocessing
         pool = multiprocessing.get_context("fork").Pool(a.workers)
-        results = pool.imap(check_one, [(p, *job) for p in files])
+        results = pool.imap(check_one, jobs)
     else:
-        results = (check_one((p, *job)) for p in files)
+        results = (check_one(j) for j in jobs)
     for p, (r, v, why) in zip(files, results):
         tally[v] += 1
         file_id = p.resolve().parent.name
