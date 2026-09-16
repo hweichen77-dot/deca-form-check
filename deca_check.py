@@ -822,7 +822,7 @@ def probe(page, rect, drawings, words, width=300, img=None, prefer="right",
 
 
 def page_role(page, native):
-    if page.get_images(full=True):
+    if page.get_image_info():
         return "content"
     if any(it[0] != "re" for d in paintable(page.get_drawings())
            for it in d["items"]):
