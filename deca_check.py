@@ -463,6 +463,7 @@ FAINT_WEAK_MIN_AREA = 0.05
 FAINT_FLOOR_CAP = 0.5
 FAINT_SIGNED_MIN = 0.5
 FAINT_SIGNED_FACTOR = 2.0
+DATE_INK_MIN = 0.05
 BELOW_REACH = 6.0
 HIGH_REACH = 10.0
 BELOW_WIDTH = 20.0
@@ -1011,6 +1012,7 @@ def anchor_points(tmpl_words, words):
 
 FIT_TRIM_ROUNDS = 4
 FIT_TRIM_FACTOR = 2.5
+FIT_MAX_TILT = 0.14
 
 
 def fit_once(pairs):
@@ -1043,6 +1045,8 @@ def similarity_fit(pairs):
         if got is None:
             return None
         mat, off, res = got
+        if abs(float(np.arctan2(mat[1, 0], mat[0, 0]))) > FIT_MAX_TILT:
+            return None
         cut = FIT_TRIM_FACTOR * max(float(np.median(res)), 1e-6)
         keep = res <= cut
         if keep.all() or int(keep.sum()) < ANCHOR_MIN:
@@ -1378,7 +1382,7 @@ def analyse(path, use_ocr=True, debug=False, slot=None, keep_words=False):
                                               img.info.get("inverted", False))
                             floor = TEMPLATES.get(form, {}).get("faint_floor", {}).get(key + ":date", 0.0)
                             entry["date_unverified"] = (d["dark"] >= TEXT_DARK_UNVERIFIED
-                                                        or area - floor >= FAINT_MIN_AREA)
+                                                        or area - floor >= DATE_INK_MIN)
                             entry["date_area"] = round(area, 3)
                     else:
                         entry.update(date_text="", date_ink=0, date_dark=0.0,
