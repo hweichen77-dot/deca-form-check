@@ -1007,7 +1007,11 @@ def anchor_points(tmpl_words, words):
             for sp, dp in zip(a[t], b[t])]
 
 
-def similarity_fit(pairs):
+FIT_TRIM_ROUNDS = 4
+FIT_TRIM_FACTOR = 2.5
+
+
+def fit_once(pairs):
     import numpy as np
     src = np.array([p[0] for p in pairs], dtype=float)
     dst = np.array([p[1] for p in pairs], dtype=float)
@@ -1024,9 +1028,25 @@ def similarity_fit(pairs):
     scale = sv.sum() * len(pairs) / var
     if not FIT_SCALE_RANGE[0] <= scale <= FIT_SCALE_RANGE[1]:
         return None
-    off = dc - scale * rot @ sc
-    res = float(np.sqrt((((src @ (scale * rot).T + off) - dst) ** 2).sum(axis=1)).max())
-    return scale * rot, off, res
+    mat = scale * rot
+    off = dc - mat @ sc
+    res = np.sqrt((((src @ mat.T + off) - dst) ** 2).sum(axis=1))
+    return mat, off, res
+
+
+def similarity_fit(pairs):
+    import numpy as np
+    for _ in range(FIT_TRIM_ROUNDS):
+        got = fit_once(pairs)
+        if got is None:
+            return None
+        mat, off, res = got
+        cut = FIT_TRIM_FACTOR * max(float(np.median(res)), 1e-6)
+        keep = res <= cut
+        if keep.all() or int(keep.sum()) < ANCHOR_MIN:
+            break
+        pairs = [q for q, k in zip(pairs, keep) if k]
+    return mat, off, float(res.max()), pairs
 
 
 def page_fit(form, words):
@@ -1044,7 +1064,7 @@ def page_fit(form, words):
             fitted = similarity_fit(pairs)
             if fitted is None:
                 continue
-            mat, off, res = fitted
+            mat, off, res, pairs = fitted
             if res > FIT_MAX_RESIDUAL * median_height(words):
                 continue
             xs = [q[1][0] for q in pairs]
