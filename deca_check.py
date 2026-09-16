@@ -536,20 +536,17 @@ def crop_ocr(img, region, drop, words=(), weak=False):
 OCR_PSMS = (3, 11)
 
 
-def ocr_words(page, img=None):
+def ocr_into(crop, scale, yoff, out):
     import pytesseract
-    img = img or render(page)
-    scale = 72.0 / img.info["dpi"]
-    out = []
     for psm in OCR_PSMS:
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT,
+        data = pytesseract.image_to_data(crop, output_type=pytesseract.Output.DICT,
                                          config=f"--psm {psm}")
         seen, fresh = list(out), []
         for i, txt in enumerate(data["text"]):
             conf = int(data["conf"][i])
             if not txt.strip() or conf < CONF_LABEL:
                 continue
-            x, y = data["left"][i] * scale, data["top"][i] * scale
+            x, y = data["left"][i] * scale, data["top"][i] * scale + yoff
             w, h = data["width"][i] * scale, data["height"][i] * scale
             box = pymupdf.Rect(x, y, x + w, y + h)
             if any(abs((box & pymupdf.Rect(o[:4])).get_area()) > 0.5 * abs(box.get_area())
@@ -557,6 +554,27 @@ def ocr_words(page, img=None):
                 continue
             fresh.append((x, y, x + w, y + h, txt, conf))
         out.extend(fresh)
+    return out
+
+
+def ocr_words(page, img=None):
+    img = img or render(page)
+    return ocr_into(img, 72.0 / img.info["dpi"], 0.0, [])
+
+
+OCR_BANDS = 4
+OCR_BAND_OVERLAP = 0.06
+
+
+def ocr_band_words(img, words):
+    scale = 72.0 / img.info["dpi"]
+    out = list(words)
+    for i in range(OCR_BANDS):
+        y0 = max(0, int(img.height * (i - OCR_BAND_OVERLAP) / OCR_BANDS))
+        y1 = min(img.height, int(img.height * (i + 1 + OCR_BAND_OVERLAP) / OCR_BANDS))
+        if y1 - y0 < 8:
+            continue
+        out = ocr_into(img.crop((0, y0, img.width, y1)), scale, y0 * scale, out)
     return out
 
 
@@ -905,6 +923,8 @@ def page_bundles(doc, use_ocr, force_ocr=False):
                 ocr = ocr_words(page, img)
                 if len(native) < OCR_IF_TEXT_UNDER and confident(ocr) < OSD_MIN_WORDS:
                     img, ocr = best_rotation(page, img, ocr)
+                if len(native) < OCR_IF_TEXT_UNDER and confident(ocr) < OSD_MIN_WORDS:
+                    ocr = ocr_band_words(img, ocr)
                 words = words + ocr
                 used = True
             except Exception as e:
