@@ -461,6 +461,8 @@ FAINT_ZOOM = 2
 FAINT_MIN_AREA = 0.25
 FAINT_WEAK_MIN_AREA = 0.05
 FAINT_FLOOR_CAP = 0.5
+FAINT_SIGNED_MIN = 0.5
+FAINT_SIGNED_FACTOR = 2.0
 BELOW_REACH = 6.0
 HIGH_REACH = 10.0
 BELOW_WIDTH = 20.0
@@ -1259,6 +1261,11 @@ def analyse(path, use_ocr=True, debug=False, slot=None, keep_words=False):
                         entry["faint"] = (area - floor >= FAINT_MIN_AREA
                                           or (bool(weak) and area >= FAINT_WEAK_MIN_AREA))
                         entry["faint_area"] = round(area, 3)
+                        blank = TEMPLATES.get(form, {}).get("faint_blank", {}).get(key, 0.0)
+                        entry["faint_blank"] = round(blank, 3)
+                        entry["faint_signed"] = bool(
+                            entry["faint"] and area >= FAINT_SIGNED_MIN
+                            and area >= FAINT_SIGNED_FACTOR * blank)
                     entry["maybe_ink"] = (not entry["signed"] and img is None
                                           and INK_MAYBE <= m["ink"] < INK_MIN)
                     lh = max(rect.height, 4.0)
@@ -1438,7 +1445,7 @@ def load_templates(d, use_ocr=True):
         pages = t.get("content_pages", t["pages"])
         prof = profiles.setdefault(t["form"], {"page_counts": set(), "refs": [],
                                                "ever_found": set(), "all": set(wanted),
-                                               "faint_floor": {}})
+                                               "faint_floor": {}, "faint_blank": {}})
         prof["page_counts"].add(pages)
         prof["ever_found"] |= found
         for k, fld in t["fields"].items():
@@ -1446,6 +1453,8 @@ def load_templates(d, use_ocr=True):
                 if src in fld:
                     prof["faint_floor"][dst] = min(prof["faint_floor"].get(dst, 9e9),
                                                        fld[src], FAINT_FLOOR_CAP)
+                    prof["faint_blank"][dst] = max(prof["faint_blank"].get(dst, 0.0),
+                                                   fld[src])
         prof["refs"].append({"file": f.name, "pages": pages,
                              "missing": sorted(set(wanted) - found),
                              "words": t.get("page_words", {}),
@@ -1483,6 +1492,8 @@ def verdict(r):
         elif f.get("ink_unverified"):
             unsure.append(f"{key}: something is written on the line but it could "
                           "not be read, check by eye")
+        elif f.get("faint_signed"):
+            pass
         elif f.get("faint"):
             unsure.append(f"{key}: faint or very small signature, check by eye")
         elif f.get("maybe_ink"):
