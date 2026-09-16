@@ -980,6 +980,126 @@ def detect_form(bundles, path, slot=None):
     return form, slot is not None and form != slot
 
 
+ANCHOR_MIN_LEN = 4
+ANCHOR_MIN = 3
+FIT_MAX_RESIDUAL = 1.5
+FIT_SCALE_RANGE = (0.1, 10.0)
+
+
+ANCHOR_MAX_REPEAT = 4
+
+
+def anchor_points(tmpl_words, words):
+    def index(ws):
+        seen = {}
+        for w in ws:
+            if w[5] < CONF_CONTENT:
+                continue
+            t = norm(w[4])
+            if len(t) < ANCHOR_MIN_LEN:
+                continue
+            seen.setdefault(t, []).append(((w[1] + w[3]) / 2, (w[0] + w[2]) / 2))
+        return {t: sorted(v) for t, v in seen.items() if len(v) <= ANCHOR_MAX_REPEAT}
+
+    a, b = index(tmpl_words), index(words)
+    return [((sp[1], sp[0]), (dp[1], dp[0]))
+            for t in a.keys() & b.keys() if len(a[t]) == len(b[t])
+            for sp, dp in zip(a[t], b[t])]
+
+
+def similarity_fit(pairs):
+    import numpy as np
+    src = np.array([p[0] for p in pairs], dtype=float)
+    dst = np.array([p[1] for p in pairs], dtype=float)
+    sc, dc = src.mean(axis=0), dst.mean(axis=0)
+    s, d = src - sc, dst - dc
+    var = (s ** 2).sum()
+    if var <= 1e-9:
+        return None
+    u, sv, vt = np.linalg.svd(s.T @ d / len(pairs))
+    rot = (u @ vt).T
+    if np.linalg.det(rot) < 0:
+        vt[-1] *= -1
+        rot = (u @ vt).T
+    scale = sv.sum() * len(pairs) / var
+    if not FIT_SCALE_RANGE[0] <= scale <= FIT_SCALE_RANGE[1]:
+        return None
+    off = dc - scale * rot @ sc
+    res = float(np.sqrt((((src @ (scale * rot).T + off) - dst) ** 2).sum(axis=1)).max())
+    return scale * rot, off, res
+
+
+def page_fit(form, words):
+    best = None
+    if len(words) < ANCHOR_MIN:
+        return None
+    for ref in TEMPLATES.get(form, {}).get("refs", []):
+        for tpno, tw in ref.get("words", {}).items():
+            labels = {k: v for k, v in ref.get("labels", {}).items() if v[0] == tpno}
+            if not labels:
+                continue
+            pairs = anchor_points(tw, words)
+            if len(pairs) < ANCHOR_MIN:
+                continue
+            fitted = similarity_fit(pairs)
+            if fitted is None:
+                continue
+            mat, off, res = fitted
+            if res > FIT_MAX_RESIDUAL * median_height(words):
+                continue
+            xs = [q[1][0] for q in pairs]
+            ys = [q[1][1] for q in pairs]
+            span = pymupdf.Rect(min(xs), min(ys), max(xs), max(ys))
+            score = (len(pairs), -res)
+            if best is None or score > best[0]:
+                best = (score, mat, off, labels, span)
+    return None if best is None else best[1:]
+
+
+def median_height(ws):
+    hs = sorted(w[3] - w[1] for w in ws if w[5] >= CONF_CONTENT and w[3] > w[1])
+    return hs[len(hs) // 2] if hs else 10.0
+
+
+PROJECT_MAX_OVERLAP = 0.35
+PROJECT_SPAN_MARGIN = 0.15
+
+
+def project_label(fit, key, page, fields, pno, words, targets):
+    import numpy as np
+    mat, off, labels, span = fit
+    if key not in labels:
+        return None, None
+    _, rect = labels[key]
+    pts = np.array([(rect[0], rect[1]), (rect[2], rect[1]),
+                    (rect[0], rect[3]), (rect[2], rect[3])], dtype=float)
+    out = pts @ mat.T + off
+    box = pymupdf.Rect(out[:, 0].min(), out[:, 1].min(), out[:, 0].max(), out[:, 1].max())
+    box = box & page.rect
+    area = abs(box.get_area())
+    if box.is_empty or box.width < 1 or box.height < 1 or area <= 0:
+        return None, None
+    pad = pymupdf.Rect(span.x0 - PROJECT_SPAN_MARGIN * max(span.width, 1),
+                       span.y0 - PROJECT_SPAN_MARGIN * max(span.height, 1),
+                       span.x1 + PROJECT_SPAN_MARGIN * max(span.width, 1),
+                       span.y1 + PROJECT_SPAN_MARGIN * max(span.height, 1))
+    if pymupdf.Point((box.x0 + box.x1) / 2, (box.y0 + box.y1) / 2) not in pad:
+        return None, None
+    for other, f in fields.items():
+        if other == key or not f.get("found") or f.get("page") != pno or not f.get("rect"):
+            continue
+        if abs((box & pymupdf.Rect(f["rect"])).get_area()) > PROJECT_MAX_OVERLAP * area:
+            return None, None
+    grow = pymupdf.Rect(box.x0 - box.height, box.y0 - 0.3 * box.height,
+                        box.x1 + box.height, box.y1 + 0.3 * box.height)
+    local = [w for w in words
+             if pymupdf.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) in grow]
+    for other, (_, variants) in targets.items():
+        if other != key and find_label(local, variants)[1] is not None:
+            return None, None
+    return "projected:" + key, box
+
+
 STACK_ROW_GAP = 0.7
 SYNTH_ROWS = {"family_doctor": ("other_conditions", "physical_restrictions")}
 PHONE_X_FRAC = (0.53, 0.60)
@@ -1029,7 +1149,7 @@ def stacked_above(fields, pno, rect, words):
     return bool(rows) and rows[-1] - rows[0] > STACK_ROW_GAP * h
 
 
-def analyse(path, use_ocr=True, debug=False, slot=None):
+def analyse(path, use_ocr=True, debug=False, slot=None, keep_words=False):
     doc, kind = open_doc(path)
     r = {"file": pathlib.Path(path).name, "pages": doc.page_count,
          "kind": kind, "flags": [], "fields": {}}
@@ -1062,189 +1182,200 @@ def analyse(path, use_ocr=True, debug=False, slot=None):
     claimed_date_labels = []
     claimed_date_labels_x = []
 
-    for pno, b in enumerate(bundles):
-        page, words, img = b["page"], b["words"], b["img"]
-        if not words:
-            continue
-        drawings = page_drawings(page)
-        overlays = page_overlays(page)
-        for key, (ftype, variants) in targets.items():
-            if r["fields"].get(key, {}).get("found"):
-                continue
-            label, rect = find_label(words, variants)
-            if rect is None:
-                label, rect = synth_label(key, r["fields"], pno, page)
-            if rect is None:
-                continue
-            m = probe(page, rect, drawings, words,
-                      width=TEXT_WIDTH if ftype == "text" else 300, img=img,
-                      prefer=spec.get("geom", "right"),
-                      allow_other=(ftype == "sig"), fallback_text=False,
-                      overlays=overlays, tight=b["tight"], whole_ink=(ftype == "text"),
-                      sig_field=(ftype == "sig"),
-                      right_down=spec.get("reach_down", {}).get(
-                          key, SCAN_DOWN if b["tight"] else (0.2 if ftype == "text" else None)))
-            tail = label_tail(words, rect, variants)
-            if tail:
-                m["text"] = clean(f"{tail} {m['text']}")
-                m["raw"] = clean(f"{tail} {m['raw']}")
-            entry = {"found": True, "page": pno, "label": label, "geom": m["geom"],
-                     "ocr": b["ocr"], "ink": m["ink"], "dark": round(m["dark"], 4),
-                     "text": m["text"], "overlay": m["overlay"],
-                     "rect": tuple(rect), "reg": tuple(m["reg"]) if m["reg"] else None}
-            if ftype == "sig":
-                mark = m.get("raw") or m["text"]
-                entry["signed"] = m["ink"] >= INK_MIN or bool(mark) or m["overlay"] > 0
-                entry["ink_unverified"] = (not entry["signed"]
-                                           and img is not None
-                                           and m["dark"] >= DARK_UNVERIFIED)
-                entry["faint"] = False
-                if not entry["signed"] and not entry["ink_unverified"] and img is not None \
-                        and m["pref_reg"] is not None:
-                    area = faint_area(page, m["pref_reg"], words, rect.height,
-                                      img.info.get("inverted", False))
-                    weak = crop_ocr(img, m["pref_reg"], DROP, words, weak=True)
-                    floor = TEMPLATES.get(form, {}).get("faint_floor", {}).get(key, 0.0)
-                    entry["faint"] = (area - floor >= FAINT_MIN_AREA
-                                      or (bool(weak) and area >= FAINT_WEAK_MIN_AREA))
-                    entry["faint_area"] = round(area, 3)
-                entry["maybe_ink"] = (not entry["signed"] and img is None
-                                      and INK_MAYBE <= m["ink"] < INK_MIN)
-                lh = max(rect.height, 4.0)
-                entry["below"] = False
-                if not any(entry[k] for k in ("signed", "ink_unverified", "faint", "maybe_ink")):
-                    if spec.get("geom") == "right":
-                        nxt = [w[1] for w in words if w[5] >= CONF_CONTENT and w[1] > rect.y1 + 0.5 * lh
-                               and w[0] < rect.x0 + BELOW_WIDTH * lh and w[2] > rect.x0]
-                        breg = pymupdf.Rect(rect.x0, rect.y1 + 0.2 * lh,
-                                            min(page.rect.x1, rect.x0 + BELOW_WIDTH * lh),
-                                            min(rect.y1 + BELOW_REACH * lh,
-                                                min(nxt) - 0.2 * lh if nxt else page.rect.y1))
-                    else:
-                        prv = [w[3] for w in words if w[5] >= CONF_CONTENT and w[3] < rect.y0 - 0.5 * lh
-                               and w[0] < rect.x0 + BELOW_WIDTH * lh and w[2] > rect.x0
-                               and re.search(r"[A-Za-z]{3}", str(w[4]))]
-                        breg = pymupdf.Rect(rect.x0, max(rect.y0 - HIGH_REACH * lh,
-                                                         max(prv) + 0.2 * lh if prv else 0),
-                                            min(page.rect.x1, rect.x0 + BELOW_WIDTH * lh),
-                                            rect.y0 - 0.2 * lh)
-                    if breg.height >= lh:
-                        area = faint_area(page, breg, words, rect.height,
-                                          img.info.get("inverted", False) if img is not None else False)
-                        entry["below"] = area >= BELOW_MIN_AREA
-                        entry["below_area"] = round(area, 3)
-                mid = (rect.y0 + rect.y1) / 2
-                near = sorted((w for w in words if abs(w[1] - rect.y0) < 4.2 * lh),
-                              key=lambda w: (round(abs((w[1] + w[3]) / 2 - mid) / lh), w[0]))
-                dlabel, drect = None, None
-                found = []
-                for v in DATE_LABELS:
-                    pool = list(near)
-                    while pool:
-                        _, cand = find_label(pool, [v])
-                        if cand is None:
-                            break
-                        cy = (cand.y0 + cand.y1) / 2
-                        if not any(abs(cy - y) < 0.5 * lh for y in claimed_date_labels):
-                            found.append((abs(cy - mid), cand))
-                        pool = [w for w in pool if abs((w[1] + w[3]) / 2 - cy) >= 0.5 * lh]
-                if found:
-                    dlabel, drect = "Date", min(found, key=lambda f: f[0])[1]
-                if drect is None:
-                    taken = [(x, y) for x, y in claimed_date_labels_x if abs(y - mid) < 4.2 * lh]
-                    if taken:
-                        drect = pymupdf.Rect(taken[0][0], rect.y0, taken[0][0] + 2.5 * lh, rect.y1)
-                        dlabel = "Date"
-                if drect is not None:
-                    claimed_date_labels.append((drect.y0 + drect.y1) / 2)
-                    claimed_date_labels_x.append((drect.x0, (drect.y0 + drect.y1) / 2))
-                entry["date_found"] = drect is not None
-                if drect is not None:
-                    d = probe(page, drect, drawings, words, width=200, img=img,
-                              prefer=spec.get("geom", "right"),
-                              allow_other=(spec.get("geom") == "above"),
-                              overlays=overlays, extra_up=DATE_EXTRA_UP, tight=b["tight"],
-                              whole_ink=True, right_up=(None if b["tight"] else 1.2),
-                              right_down=(SCAN_DOWN if b["tight"] else None),
-                              left_to_prev=(spec.get("geom") == "above"))
-                    dtail = label_tail(words, drect, ["Date"])
-                    if dtail:
-                        d["text"] = clean(f"{dtail} {d['text']}")
-                        d["raw"] = clean(f"{dtail} {d['raw']}")
-                    entry["date_text"] = d["text"]
-                    entry["date_ink"] = d["ink"]
-                    entry["date_dark"] = round(d["dark"], 4)
-                    entry["date_present"] = bool(d.get("raw") or d["text"]) \
-                        or d["ink"] >= TEXT_INK_MIN or d["overlay"] > 0
-                    if not entry["date_present"] and d["reg"] is not None:
-                        zone = pymupdf.Rect(d["reg"].x0, min(rect.y0, drect.y0) - 0.5 * lh,
-                                            d["reg"].x1, max(rect.y1, drect.y1) + 0.5 * lh)
-                        stray = [w for w in words if w[5] >= CONF_CONTENT
-                                 and pymupdf.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) in zone
-                                 and DATE_RE.search(str(w[4]))]
-                        if stray:
-                            entry["date_present"] = True
-                            entry["date_text"] = clean(" ".join(str(w[4]) for w in stray))
-                    entry["date_unverified"] = False
-                    entry["date_shared"] = False
-                    if entry["date_present"] and d["ink"] < TEXT_INK_MIN and d["overlay"] == 0 \
-                            and d["reg"] is not None:
-                        zone = pymupdf.Rect(d["reg"].x0 - TEXT_X_SLACK * lh,
-                                            min(d["reg"].y0, rect.y0 - 0.5 * lh),
-                                            d["reg"].x1,
-                                            max(d["reg"].y1, rect.y1 + 0.5 * lh, drect.y1 + 0.5 * lh))
-                        dmid = (drect.y0 + drect.y1) / 2
-                        rows = [pymupdf.Rect(f["rect"]) for f in r["fields"].values()
-                                if f.get("found") and f.get("page") == pno and "signed" in f] + [rect]
-                        zone.y0 = max(zone.y0, min(x.y0 for x in rows) - 0.5 * lh)
-                        zone.y1 = min(zone.y1, max(x.y1 for x in rows) + 0.5 * lh)
-                        mine = sorted((((w[0] + w[2]) / 2, (w[1] + w[3]) / 2, norm(w[4]))
-                                       for w in words if w[5] >= CONF_CONTENT
-                                       and pymupdf.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) in zone
-                                       and re.search(r"\d", str(w[4]))),
-                                      key=lambda m: abs(m[1] - dmid))
+    if keep_words:
+        r["page_words"] = {i: list(b["words"]) for i, b in enumerate(bundles) if b["words"]}
 
-                        def taken(m):
-                            return any(abs(m[0] - x) < lh and abs(m[1] - y) < 0.5 * lh and m[2] == n
-                                       for x, y, n in claimed_dates)
-                        free = [m for m in mine if not taken(m)]
-                        if mine and not free:
-                            entry["date_present"] = False
-                            entry["date_shared"] = True
-                        if free:
-                            claimed_dates.extend(m for m in free if abs(m[1] - free[0][1]) < 0.5 * lh)
-                        if debug:
-                            print(f"    DBG {key} date label={[round(x) for x in drect]} zone={[round(x) for x in zone]} mine={[(round(x), round(y), t) for x, y, t in mine]} free={len(free)}")
-                    if not entry["date_present"] and img is not None and d["pref_reg"] is not None:
-                        area = faint_area(page, d["pref_reg"], words, drect.height,
+    for projecting in (False, True):
+        if projecting and (keep_words or all(r["fields"].get(k, {}).get("found")
+                                             for k in targets)):
+            break
+        for pno, b in enumerate(bundles):
+            page, words, img = b["page"], b["words"], b["img"]
+            if not words:
+                continue
+            drawings = page_drawings(page)
+            overlays = page_overlays(page)
+            fit = page_fit(form, words) if projecting else None
+            for key, (ftype, variants) in targets.items():
+                if r["fields"].get(key, {}).get("found"):
+                    continue
+                label, rect = (None, None) if projecting else find_label(words, variants)
+                if rect is None and not projecting:
+                    label, rect = synth_label(key, r["fields"], pno, page)
+                if rect is None and fit is not None:
+                    label, rect = project_label(fit, key, page, r["fields"], pno,
+                                               words, targets)
+                if rect is None:
+                    continue
+                m = probe(page, rect, drawings, words,
+                          width=TEXT_WIDTH if ftype == "text" else 300, img=img,
+                          prefer=spec.get("geom", "right"),
+                          allow_other=(ftype == "sig"), fallback_text=False,
+                          overlays=overlays, tight=b["tight"], whole_ink=(ftype == "text"),
+                          sig_field=(ftype == "sig"),
+                          right_down=spec.get("reach_down", {}).get(
+                              key, SCAN_DOWN if b["tight"] else (0.2 if ftype == "text" else None)))
+                tail = label_tail(words, rect, variants)
+                if tail:
+                    m["text"] = clean(f"{tail} {m['text']}")
+                    m["raw"] = clean(f"{tail} {m['raw']}")
+                entry = {"found": True, "page": pno, "label": label, "geom": m["geom"],
+                         "ocr": b["ocr"], "ink": m["ink"], "dark": round(m["dark"], 4),
+                         "text": m["text"], "overlay": m["overlay"],
+                         "rect": tuple(rect), "reg": tuple(m["reg"]) if m["reg"] else None}
+                if ftype == "sig":
+                    mark = m.get("raw") or m["text"]
+                    entry["signed"] = m["ink"] >= INK_MIN or bool(mark) or m["overlay"] > 0
+                    entry["ink_unverified"] = (not entry["signed"]
+                                               and img is not None
+                                               and m["dark"] >= DARK_UNVERIFIED)
+                    entry["faint"] = False
+                    if not entry["signed"] and not entry["ink_unverified"] and img is not None \
+                            and m["pref_reg"] is not None:
+                        area = faint_area(page, m["pref_reg"], words, rect.height,
                                           img.info.get("inverted", False))
-                        floor = TEMPLATES.get(form, {}).get("faint_floor", {}).get(key + ":date", 0.0)
-                        entry["date_unverified"] = (d["dark"] >= TEXT_DARK_UNVERIFIED
-                                                    or area - floor >= FAINT_MIN_AREA)
-                        entry["date_area"] = round(area, 3)
+                        weak = crop_ocr(img, m["pref_reg"], DROP, words, weak=True)
+                        floor = TEMPLATES.get(form, {}).get("faint_floor", {}).get(key, 0.0)
+                        entry["faint"] = (area - floor >= FAINT_MIN_AREA
+                                          or (bool(weak) and area >= FAINT_WEAK_MIN_AREA))
+                        entry["faint_area"] = round(area, 3)
+                    entry["maybe_ink"] = (not entry["signed"] and img is None
+                                          and INK_MAYBE <= m["ink"] < INK_MIN)
+                    lh = max(rect.height, 4.0)
+                    entry["below"] = False
+                    if not any(entry[k] for k in ("signed", "ink_unverified", "faint", "maybe_ink")):
+                        if spec.get("geom") == "right":
+                            nxt = [w[1] for w in words if w[5] >= CONF_CONTENT and w[1] > rect.y1 + 0.5 * lh
+                                   and w[0] < rect.x0 + BELOW_WIDTH * lh and w[2] > rect.x0]
+                            breg = pymupdf.Rect(rect.x0, rect.y1 + 0.2 * lh,
+                                                min(page.rect.x1, rect.x0 + BELOW_WIDTH * lh),
+                                                min(rect.y1 + BELOW_REACH * lh,
+                                                    min(nxt) - 0.2 * lh if nxt else page.rect.y1))
+                        else:
+                            prv = [w[3] for w in words if w[5] >= CONF_CONTENT and w[3] < rect.y0 - 0.5 * lh
+                                   and w[0] < rect.x0 + BELOW_WIDTH * lh and w[2] > rect.x0
+                                   and re.search(r"[A-Za-z]{3}", str(w[4]))]
+                            breg = pymupdf.Rect(rect.x0, max(rect.y0 - HIGH_REACH * lh,
+                                                             max(prv) + 0.2 * lh if prv else 0),
+                                                min(page.rect.x1, rect.x0 + BELOW_WIDTH * lh),
+                                                rect.y0 - 0.2 * lh)
+                        if breg.height >= lh:
+                            area = faint_area(page, breg, words, rect.height,
+                                              img.info.get("inverted", False) if img is not None else False)
+                            entry["below"] = area >= BELOW_MIN_AREA
+                            entry["below_area"] = round(area, 3)
+                    mid = (rect.y0 + rect.y1) / 2
+                    near = sorted((w for w in words if abs(w[1] - rect.y0) < 4.2 * lh),
+                                  key=lambda w: (round(abs((w[1] + w[3]) / 2 - mid) / lh), w[0]))
+                    dlabel, drect = None, None
+                    found = []
+                    for v in DATE_LABELS:
+                        pool = list(near)
+                        while pool:
+                            _, cand = find_label(pool, [v])
+                            if cand is None:
+                                break
+                            cy = (cand.y0 + cand.y1) / 2
+                            if not any(abs(cy - y) < 0.5 * lh for y in claimed_date_labels):
+                                found.append((abs(cy - mid), cand))
+                            pool = [w for w in pool if abs((w[1] + w[3]) / 2 - cy) >= 0.5 * lh]
+                    if found:
+                        dlabel, drect = "Date", min(found, key=lambda f: f[0])[1]
+                    if drect is None:
+                        taken = [(x, y) for x, y in claimed_date_labels_x if abs(y - mid) < 4.2 * lh]
+                        if taken:
+                            drect = pymupdf.Rect(taken[0][0], rect.y0, taken[0][0] + 2.5 * lh, rect.y1)
+                            dlabel = "Date"
+                    if drect is not None:
+                        claimed_date_labels.append((drect.y0 + drect.y1) / 2)
+                        claimed_date_labels_x.append((drect.x0, (drect.y0 + drect.y1) / 2))
+                    entry["date_found"] = drect is not None
+                    if drect is not None:
+                        d = probe(page, drect, drawings, words, width=200, img=img,
+                                  prefer=spec.get("geom", "right"),
+                                  allow_other=(spec.get("geom") == "above"),
+                                  overlays=overlays, extra_up=DATE_EXTRA_UP, tight=b["tight"],
+                                  whole_ink=True, right_up=(None if b["tight"] else 1.2),
+                                  right_down=(SCAN_DOWN if b["tight"] else None),
+                                  left_to_prev=(spec.get("geom") == "above"))
+                        dtail = label_tail(words, drect, ["Date"])
+                        if dtail:
+                            d["text"] = clean(f"{dtail} {d['text']}")
+                            d["raw"] = clean(f"{dtail} {d['raw']}")
+                        entry["date_text"] = d["text"]
+                        entry["date_ink"] = d["ink"]
+                        entry["date_dark"] = round(d["dark"], 4)
+                        entry["date_present"] = bool(d.get("raw") or d["text"]) \
+                            or d["ink"] >= TEXT_INK_MIN or d["overlay"] > 0
+                        if not entry["date_present"] and d["reg"] is not None:
+                            zone = pymupdf.Rect(d["reg"].x0, min(rect.y0, drect.y0) - 0.5 * lh,
+                                                d["reg"].x1, max(rect.y1, drect.y1) + 0.5 * lh)
+                            stray = [w for w in words if w[5] >= CONF_CONTENT
+                                     and pymupdf.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) in zone
+                                     and DATE_RE.search(str(w[4]))]
+                            if stray:
+                                entry["date_present"] = True
+                                entry["date_text"] = clean(" ".join(str(w[4]) for w in stray))
+                        entry["date_unverified"] = False
+                        entry["date_shared"] = False
+                        if entry["date_present"] and d["ink"] < TEXT_INK_MIN and d["overlay"] == 0 \
+                                and d["reg"] is not None:
+                            zone = pymupdf.Rect(d["reg"].x0 - TEXT_X_SLACK * lh,
+                                                min(d["reg"].y0, rect.y0 - 0.5 * lh),
+                                                d["reg"].x1,
+                                                max(d["reg"].y1, rect.y1 + 0.5 * lh, drect.y1 + 0.5 * lh))
+                            dmid = (drect.y0 + drect.y1) / 2
+                            rows = [pymupdf.Rect(f["rect"]) for f in r["fields"].values()
+                                    if f.get("found") and f.get("page") == pno and "signed" in f] + [rect]
+                            zone.y0 = max(zone.y0, min(x.y0 for x in rows) - 0.5 * lh)
+                            zone.y1 = min(zone.y1, max(x.y1 for x in rows) + 0.5 * lh)
+                            mine = sorted((((w[0] + w[2]) / 2, (w[1] + w[3]) / 2, norm(w[4]))
+                                           for w in words if w[5] >= CONF_CONTENT
+                                           and pymupdf.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) in zone
+                                           and re.search(r"\d", str(w[4]))),
+                                          key=lambda m: abs(m[1] - dmid))
+
+                            def taken(m):
+                                return any(abs(m[0] - x) < lh and abs(m[1] - y) < 0.5 * lh and m[2] == n
+                                           for x, y, n in claimed_dates)
+                            free = [m for m in mine if not taken(m)]
+                            if mine and not free:
+                                entry["date_present"] = False
+                                entry["date_shared"] = True
+                            if free:
+                                claimed_dates.extend(m for m in free if abs(m[1] - free[0][1]) < 0.5 * lh)
+                            if debug:
+                                print(f"    DBG {key} date label={[round(x) for x in drect]} zone={[round(x) for x in zone]} mine={[(round(x), round(y), t) for x, y, t in mine]} free={len(free)}")
+                        if not entry["date_present"] and img is not None and d["pref_reg"] is not None:
+                            area = faint_area(page, d["pref_reg"], words, drect.height,
+                                              img.info.get("inverted", False))
+                            floor = TEMPLATES.get(form, {}).get("faint_floor", {}).get(key + ":date", 0.0)
+                            entry["date_unverified"] = (d["dark"] >= TEXT_DARK_UNVERIFIED
+                                                        or area - floor >= FAINT_MIN_AREA)
+                            entry["date_area"] = round(area, 3)
+                    else:
+                        entry.update(date_text="", date_ink=0, date_dark=0.0,
+                                     date_present=False, date_unverified=False)
                 else:
-                    entry.update(date_text="", date_ink=0, date_dark=0.0,
-                                 date_present=False, date_unverified=False)
-            else:
-                entry["filled"] = bool(m.get("raw") or m["text"]) or m["ink"] >= TEXT_INK_MIN \
-                    or m["overlay"] > 0
-                entry["ink_unverified"] = (not entry["filled"] and img is not None
-                                           and m["dark"] >= TEXT_DARK_UNVERIFIED)
-                if not entry["filled"] and not entry["ink_unverified"] and spec.get("geom") == "right":
-                    entry["ink_unverified"] = stacked_above(r["fields"], pno, rect, words)
-                if not entry["filled"] and not entry["ink_unverified"] and img is not None \
-                        and m["pref_reg"] is not None and m["dark"] >= CROP_OCR_MIN_DARK:
-                    area = faint_area(page, m["pref_reg"], words, rect.height,
-                                      img.info.get("inverted", False))
-                    floor = TEMPLATES.get(form, {}).get("faint_floor", {}).get(key, 0.0)
-                    entry["ink_unverified"] = area - floor >= FAINT_MIN_AREA
-                    entry["faint_area"] = round(area, 3)
-            r["fields"][key] = entry
-            if debug:
-                print(f"    DBG {key:14s} p{pno} ink={m['ink']:5d} ov={m['overlay']} "
-                      f"dark={m['dark']:.4f} geom={m['geom']} text={m['text'][:24]!r} "
-                      f"raw={m.get('raw','')[:24]!r} faint={entry.get('faint_area', '-')} "
-                      f"date={entry.get('date_text', '-')!r}/{entry.get('date_area', '-')}")
+                    entry["filled"] = bool(m.get("raw") or m["text"]) or m["ink"] >= TEXT_INK_MIN \
+                        or m["overlay"] > 0
+                    entry["ink_unverified"] = (not entry["filled"] and img is not None
+                                               and m["dark"] >= TEXT_DARK_UNVERIFIED)
+                    if not entry["filled"] and not entry["ink_unverified"] and spec.get("geom") == "right":
+                        entry["ink_unverified"] = stacked_above(r["fields"], pno, rect, words)
+                    if not entry["filled"] and not entry["ink_unverified"] and img is not None \
+                            and m["pref_reg"] is not None and m["dark"] >= CROP_OCR_MIN_DARK:
+                        area = faint_area(page, m["pref_reg"], words, rect.height,
+                                          img.info.get("inverted", False))
+                        floor = TEMPLATES.get(form, {}).get("faint_floor", {}).get(key, 0.0)
+                        entry["ink_unverified"] = area - floor >= FAINT_MIN_AREA
+                        entry["faint_area"] = round(area, 3)
+                r["fields"][key] = entry
+                if debug:
+                    print(f"    DBG {key:14s} p{pno} ink={m['ink']:5d} ov={m['overlay']} "
+                          f"dark={m['dark']:.4f} geom={m['geom']} text={m['text'][:24]!r} "
+                          f"raw={m.get('raw','')[:24]!r} faint={entry.get('faint_area', '-')} "
+                          f"date={entry.get('date_text', '-')!r}/{entry.get('date_area', '-')}")
 
     for key in targets:
         r["fields"].setdefault(key, {"found": False})
@@ -1274,7 +1405,7 @@ def load_templates(d, use_ocr=True):
         if f.suffix.lower() not in {".pdf"} | IMG_EXT or not f.is_file():
             continue
         try:
-            t = analyse(f, use_ocr=use_ocr)
+            t = analyse(f, use_ocr=use_ocr, keep_words=True)
         except Exception as e:
             print(f"  {f.name}: FAILED {type(e).__name__}: {e}")
             continue
@@ -1296,7 +1427,10 @@ def load_templates(d, use_ocr=True):
                     prof["faint_floor"][dst] = min(prof["faint_floor"].get(dst, 9e9),
                                                        fld[src], FAINT_FLOOR_CAP)
         prof["refs"].append({"file": f.name, "pages": pages,
-                             "missing": sorted(set(wanted) - found)})
+                             "missing": sorted(set(wanted) - found),
+                             "words": t.get("page_words", {}),
+                             "labels": {k: (t["fields"][k]["page"], t["fields"][k]["rect"])
+                                        for k in found}})
         miss = sorted(set(wanted) - found)
         note = f"  [{len(miss)} label(s) not on this one: {', '.join(miss)}]" if miss else ""
         print(f"  {f.name}: {t['form']}, {pages} content pages{note}")
